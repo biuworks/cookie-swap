@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "账号快照",
+  "description": "保存当前网站的登录态（Cookie 与本地存储），在多个已保存账号之间一键切换，不退出、不重新登录。",
+  "version": "0.1.0",
+  "permissions": ["cookies", "storage", "tabs", "scripting", "unlimitedStorage"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_title": "账号快照",
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  }
+}

@@ -1,0 +1,6 @@
+# 仓库里统一存 LF，避免不同平台克隆或提交时产生整文件的行尾变更 diff。
+# 注意：eol=lf 会让 Windows 上的工作区也是 LF，而不是 CRLF。
+* text=auto eol=lf
+
+# 图标是二进制，明确排除在行尾转换之外。
+*.png binary

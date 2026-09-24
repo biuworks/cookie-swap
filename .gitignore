@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+Thumbs.db
+scratch/
+
+# 本地设计稿，不随仓库发布
+design/

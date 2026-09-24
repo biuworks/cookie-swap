@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>账号快照</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header class="hd">
+      <svg class="mark" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+        <rect width="32" height="32" rx="8" fill="#0c6b52"></rect>
+        <path d="M7 12.5h13.5M17 8.5l4.5 4-4.5 4" fill="none" stroke="#f7fffb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+        <path d="M25 19.5H11.5M15 15.5l-4.5 4 4.5 4" fill="none" stroke="#f7fffb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+      <div class="hd-txt">
+        <h1>账号快照</h1>
+        <p id="host" class="host">正在读取当前页面…</p>
+      </div>
+      <button id="info-toggle" class="icon" type="button" data-act="info" aria-label="安全说明" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"></circle>
+          <path d="M12 11v5M12 7.6v.2"></path>
+        </svg>
+      </button>
+    </header>
+
+    <main id="body" class="body"></main>
+    <footer id="foot" class="ft"></footer>
+
+    <div id="toast" class="toast" role="status" hidden>
+      <span id="toast-text" class="grow"></span>
+      <button id="toast-undo" class="toast-btn" type="button" data-act="toast-undo" hidden>撤销</button>
+      <button id="toast-close" class="toast-btn" type="button" data-act="toast-close" aria-label="关闭">&#10005;</button>
+      <span id="toast-timer" class="toast-timer" hidden></span>
+    </div>
+
+    <div id="scrim" class="scrim" hidden></div>
+
+    <section id="info-pop" class="pop" role="dialog" aria-label="安全说明" hidden>
+      <h3>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+        </svg>
+        关于这些快照
+      </h3>
+      <ul>
+        <li><span class="idx">1</span><span>只存在这台浏览器里，<b>没有上传到任何服务器</b>。</span></li>
+        <li><span class="idx">2</span><span class="warn">包含可直接登录的会话，不要在公司或公用电脑上保存。</span></li>
+        <li><span class="idx">3</span><span>切换账号会刷新当前页面；只有在页面里有没提交的内容时才会先问你一次。</span></li>
+      </ul>
+      <button id="info-close" class="btn sec sm block" type="button" data-act="info-close">知道了</button>
+    </section>
+
+    <section id="sheet" class="sheet-scrim" role="dialog" aria-modal="true" hidden></section>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

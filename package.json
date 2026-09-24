@@ -1,0 +1,8 @@
+{
+  "name": "cookie-swap",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
