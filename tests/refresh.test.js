@@ -14,6 +14,7 @@ import {
   ingestCookieChange,
   initialRefreshState,
   learnedIsConfirmed,
+  mergeStorageWhenUnconfirmed,
   MAX_WAIT_MS,
   reduceRefresh,
   resetFlushScriptCache,
@@ -22,6 +23,7 @@ import {
   stageCapture,
   syncFlushScript,
   TRAIL_MS,
+  unconfirmedFlushAction,
   WRITEBACK_BUDGET_MS,
   writebackBudgetRemaining,
 } from "../src/refresh.js";
@@ -678,4 +680,103 @@ test("an unconfirmed learned rotation does not write account B over account A", 
   });
   assert.equal(confirmed.action, "write");
   assert.equal(confirmed.write, true);
+});
+
+test("unconfirmed binding keeps status ok when flush-storage does not change storage", () => {
+  const binding = {
+    site: "shop.test",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  const state = initialRefreshState({ bindings: { "shop.test": binding } });
+  assert.equal(mergeStorageWhenUnconfirmed(binding), "skip");
+  assert.equal(state.bindings["shop.test"].status, "ok");
+  assert.equal(state.bindings["shop.test"].pendingUpdate, false);
+  assert.equal(state.bindings["shop.test"].paused, false);
+
+  const background = fs.readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const mergeFn = background.slice(
+    background.indexOf("async function mergeBoundStorage"),
+    background.indexOf("async function flushStorageMessage"),
+  );
+  assert.match(mergeFn, /mergeStorageWhenUnconfirmed\(binding\) === "skip"\) return/);
+  assert.doesNotMatch(mergeFn, /action:\s*"pending"/);
+});
+
+test("unconfirmed switch flush that only changes storage does not enter pending", () => {
+  const baseline = [
+    cookie("sid", "a-sid", { session: true, domain: "shop.test" }),
+    cookie("uid", "a-uid", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("_ga", "GA1.2.1.1", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("lang", "zh", { expirationDate: 9_000, domain: "shop.test" }),
+  ];
+  const live = baseline.map((item) => ({ ...item }));
+  const classification = resolveClassification({
+    siteKey: "shop.test",
+    baseline,
+    live,
+    builtin: {},
+    user: {},
+    learned: null,
+  });
+  const binding = {
+    site: "shop.test",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  const decision = evaluateLiveCookies({
+    classification,
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(decision.pendingUpdate, false);
+  const action = unconfirmedFlushAction({
+    binding,
+    decision,
+    baselineCookies: baseline,
+    liveCookies: live,
+    storageChanged: true,
+  });
+  assert.equal(action, "skip");
+  const state = initialRefreshState({ bindings: { "shop.test": binding } });
+  assert.equal(state.bindings["shop.test"].status, "ok");
+  assert.equal(state.bindings["shop.test"].pendingUpdate, false);
+
+  const rotated = live.map((item) => item.name === "sid" ? { ...item, value: "b-sid" } : item);
+  const rotatedDecision = evaluateLiveCookies({
+    classification: resolveClassification({
+      siteKey: "shop.test",
+      baseline,
+      live: rotated,
+      builtin: {},
+      user: {},
+      learned: null,
+    }),
+    baseline,
+    live: rotated,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(unconfirmedFlushAction({
+    binding,
+    decision: rotatedDecision,
+    baselineCookies: baseline,
+    liveCookies: rotated,
+    storageChanged: true,
+  }), "pending");
+  assert.equal(unconfirmedFlushAction({
+    binding: { ...binding, learned: { auth: ["sid"], identity: ["uid"] } },
+    decision,
+    baselineCookies: baseline,
+    liveCookies: live,
+    storageChanged: true,
+  }), "confirmed");
 });

@@ -372,6 +372,39 @@ export function learnedIsConfirmed(binding) {
   );
 }
 
+/**
+ * 身份还没确认时，切号前的 flush 只在 Cookie 真有变化时标待更新。
+ * 页面存储单独变化（站内跳转、刷新也会触发）直接跳过：不写快照，也不标 pending。
+ */
+export function unconfirmedFlushAction({
+  binding,
+  decision = null,
+  baselineCookies = null,
+  liveCookies = null,
+  storageChanged = false,
+} = {}) {
+  if (learnedIsConfirmed(binding)) return "confirmed";
+  if (decision?.action === "pause" || decision?.action === "unbind") return decision.action;
+  const cookiesChanged = baselineCookies != null
+    && liveCookies != null
+    && materiallyChanged(baselineCookies, liveCookies);
+  if (
+    cookiesChanged
+    || decision?.action === "write"
+    || decision?.action === "pending"
+    || decision?.pendingUpdate === true
+  ) {
+    return "pending";
+  }
+  if (storageChanged) return "skip";
+  return "skip";
+}
+
+/** pagehide 只负责已确认身份的存储合并。未确认时交给 Cookie 路径决定要不要待更新。 */
+export function mergeStorageWhenUnconfirmed(binding) {
+  return learnedIsConfirmed(binding) ? "merge" : "skip";
+}
+
 export function evaluateLiveCookies({
   classification,
   baseline,

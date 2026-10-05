@@ -50,12 +50,14 @@ import {
   initialRefreshState,
   keyExpiryTimes,
   learnedIsConfirmed,
+  mergeStorageWhenUnconfirmed,
   reduceRefresh,
   REFRESH_STATE_KEY,
   resolveClassification,
   rollbackCapture,
   siteLocked,
   stageCapture,
+  unconfirmedFlushAction,
   syncFlushScript,
   writebackBudgetRemaining,
 } from "./refresh.js";
@@ -521,9 +523,15 @@ async function flushBoundSnapshot(tab, binding) {
     : null;
   const storageChanged = JSON.stringify(localStorage) !== JSON.stringify(capture.localStorage || {})
     || JSON.stringify(sessionStorage) !== JSON.stringify(capture.sessionStorage || {});
-  const action = !learnedConfirmed && (decision.action === "write" || decision.pendingUpdate || storageChanged)
-    ? "pending"
-    : decision.action;
+  const flushAction = unconfirmedFlushAction({
+    binding,
+    decision,
+    baselineCookies: capture.cookies,
+    liveCookies: live,
+    storageChanged,
+  });
+  if (flushAction === "skip") return;
+  const action = flushAction === "confirmed" ? decision.action : flushAction;
   if (action === "pending" || action === "pause" || action === "unbind") {
     const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
     refreshState = applied.state;
@@ -555,17 +563,7 @@ async function mergeBoundStorage(siteKey, storage) {
   const binding = bindingFor(refreshState, siteKey);
   if (!binding?.snapshotId) return;
   if (binding.paused || binding.status === "identity-unknown" || binding.status === "maybe-logged-out") return;
-  if (!learnedIsConfirmed(binding)) {
-    const applied = applyDecision(refreshState, {
-      action: "pending",
-      site: siteKey,
-      expiresAt: binding.expiresAt ?? null,
-    });
-    refreshState = applied.state;
-    await persistRefresh();
-    await updateBadge();
-    return;
-  }
+  if (mergeStorageWhenUnconfirmed(binding) === "skip") return;
   const capture = await readProfileCapture(binding.snapshotId);
   if (!capture) return;
   const next = {
