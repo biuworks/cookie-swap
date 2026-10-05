@@ -18,6 +18,7 @@ import {
   mergeStorageWhenUnconfirmed,
   MAX_WAIT_MS,
   reduceRefresh,
+  planFlushCapture,
   refreshCookiesInPlace,
   resetFlushScriptCache,
   resolveClassification,
@@ -1056,4 +1057,102 @@ test("confirmed expiry slide refreshes cookies in place and keeps the previous a
   assert.equal(rolled.canRollback, false);
   assert.equal(rolled.capture.cookies.find((item) => item.name === "sid").value, "A");
   assert.equal(rolled.capture.localStorage.who, "A");
+});
+
+test("confirmed flush stages new storage when only the expiry slides", () => {
+  const learned = { auth: ["sid"], identity: ["uid"] };
+  const current = {
+    cookies: [
+      cookie("sid", "B", { expirationDate: 100, domain: "example.com" }),
+      cookie("uid", "1", { expirationDate: 9_000, domain: "example.com" }),
+    ],
+    localStorage: { who: "B", note: "old" },
+    sessionStorage: { tab: "1" },
+    prev: {
+      cookies: [
+        cookie("sid", "A", { expirationDate: 50, domain: "example.com" }),
+        cookie("uid", "1", { expirationDate: 9_000, domain: "example.com" }),
+      ],
+      localStorage: { who: "A" },
+      sessionStorage: {},
+    },
+  };
+  const live = current.cookies.map((item) => (
+    item.name === "sid" ? { ...item, expirationDate: 800 } : item
+  ));
+  const decision = evaluateLiveCookies({
+    classification: resolveClassification({
+      siteKey: "example.com",
+      baseline: current.cookies,
+      live,
+      builtin: {},
+      user: {},
+      learned,
+    }),
+    baseline: current.cookies,
+    live,
+    now: 1_000,
+    learnedConfirmed: true,
+  });
+  assert.equal(decision.action, "refresh-cookies");
+  assert.deepEqual(decision.authNames, ["sid"]);
+
+  const staged = planFlushCapture({
+    confirmed: true,
+    storageChanged: true,
+    capture: current,
+    live,
+    localStorage: { who: "B", note: "new" },
+    sessionStorage: { tab: "2" },
+  });
+  assert.equal(staged.mode, "stage");
+  assert.equal(staged.capture.cookies.find((item) => item.name === "sid").value, "B");
+  assert.equal(staged.capture.cookies.find((item) => item.name === "sid").expirationDate, 800);
+  assert.equal(staged.capture.localStorage.note, "new");
+  assert.equal(staged.capture.localStorage.who, "B");
+  assert.equal(staged.capture.sessionStorage.tab, "2");
+  assert.equal(staged.capture.prev.localStorage.note, "old");
+  assert.equal(staged.capture.prev.cookies.find((item) => item.name === "sid").expirationDate, 100);
+
+  const expiryOnly = planFlushCapture({
+    confirmed: true,
+    storageChanged: false,
+    capture: current,
+    live,
+    localStorage: { who: "B", note: "new" },
+    sessionStorage: { tab: "2" },
+  });
+  assert.equal(expiryOnly.mode, "in-place");
+  assert.equal(expiryOnly.capture.localStorage.note, "old");
+  assert.equal(expiryOnly.capture.sessionStorage.tab, "1");
+  assert.equal(expiryOnly.capture.cookies.find((item) => item.name === "sid").expirationDate, 800);
+  assert.equal(expiryOnly.capture.prev.cookies.find((item) => item.name === "sid").value, "A");
+  assert.equal(expiryOnly.capture.prev.localStorage.who, "A");
+
+  const unconfirmed = planFlushCapture({
+    confirmed: false,
+    storageChanged: true,
+    capture: { cookies: current.cookies, localStorage: { token: "a" }, sessionStorage: { tab: "1" } },
+    live,
+    localStorage: { token: "b" },
+    sessionStorage: { tab: "9" },
+  });
+  assert.equal(unconfirmed.mode, "in-place");
+  assert.equal(unconfirmed.capture.prev, undefined);
+  assert.equal(unconfirmed.capture.localStorage.token, "a");
+  assert.equal(unconfirmed.capture.sessionStorage.tab, "1");
+  assert.equal(unconfirmed.capture.cookies.find((item) => item.name === "sid").expirationDate, 800);
+
+  const background = fs.readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const autoWrite = background.slice(
+    background.indexOf("async function runAutoWrite"),
+    background.indexOf("async function flushBoundSnapshot"),
+  );
+  const flush = background.slice(
+    background.indexOf("async function flushBoundSnapshot"),
+    background.indexOf("async function mergeBoundStorage"),
+  );
+  assert.match(autoWrite, /refreshCookiesInPlace\(/);
+  assert.doesNotMatch(autoWrite, /planFlushCapture\(/);
+  assert.match(flush, /planFlushCapture\(/);
 });

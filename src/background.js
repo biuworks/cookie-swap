@@ -52,6 +52,7 @@ import {
   keyExpiryTimes,
   learnedIsConfirmed,
   mergeStorageWhenUnconfirmed,
+  planFlushCapture,
   reduceRefresh,
   refreshCookiesInPlace,
   REFRESH_STATE_KEY,
@@ -557,17 +558,44 @@ async function flushBoundSnapshot(tab, binding) {
   }
   if (action === "refresh-cookies") {
     const refreshedAt = Date.now();
-    await commitBoundCapture(
-      profile,
-      profiles,
-      refreshCookiesInPlace(capture, live),
-      cookieRefreshMeta(profile, decision, refreshedAt),
-    );
+    const planned = planFlushCapture({
+      confirmed: learnedConfirmed,
+      storageChanged,
+      capture,
+      live,
+      localStorage,
+      sessionStorage,
+    });
+    if (planned.mode === "in-place") {
+      await commitBoundCapture(
+        profile,
+        profiles,
+        planned.capture,
+        cookieRefreshMeta(profile, decision, refreshedAt),
+      );
+      const applied = applyDecision(refreshState, {
+        ...decision,
+        action,
+        site: binding.site,
+        learned: null,
+        now: refreshedAt,
+      });
+      refreshState = applied.state;
+      await persistRefresh();
+      await updateBadge();
+      return;
+    }
+    await commitBoundCapture(profile, profiles, planned.capture, {
+      savedAt: profile.savedAt,
+      lastRefreshedAt: refreshedAt,
+      canRollback: true,
+      authNames: classification.auth,
+    });
     const applied = applyDecision(refreshState, {
       ...decision,
-      action,
+      action: "write",
       site: binding.site,
-      learned: null,
+      learned,
       now: refreshedAt,
     });
     refreshState = applied.state;

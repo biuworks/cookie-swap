@@ -585,6 +585,27 @@ export function refreshCookiesInPlace(capture, live) {
   return next;
 }
 
+/**
+ * 切号前的 flush：未确认，或存储没变，只就地改 Cookie。
+ * 已确认并且 localStorage/sessionStorage 变了，则连同新存储写成一层可回滚的快照。
+ */
+export function planFlushCapture({
+  confirmed = false,
+  storageChanged = false,
+  capture,
+  live,
+  localStorage,
+  sessionStorage,
+} = {}) {
+  if (!confirmed || !storageChanged) {
+    return { mode: "in-place", capture: refreshCookiesInPlace(capture, live) };
+  }
+  return {
+    mode: "stage",
+    capture: stageCapture(capture, { cookies: live, localStorage, sessionStorage }),
+  };
+}
+
 export function cookieRefreshMeta(profile, decision, now) {
   return {
     savedAt: profile?.savedAt,
