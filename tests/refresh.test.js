@@ -7,6 +7,7 @@ import {
   BUILTIN_SITE_RULES,
   bindingFor,
   buildRefreshView,
+  cookieRefreshMeta,
   debounceDelay,
   evaluateLiveCookies,
   FLUSH_SCRIPT_ID,
@@ -17,6 +18,7 @@ import {
   mergeStorageWhenUnconfirmed,
   MAX_WAIT_MS,
   reduceRefresh,
+  refreshCookiesInPlace,
   resetFlushScriptCache,
   resolveClassification,
   rollbackCapture,
@@ -818,22 +820,34 @@ test("unconfirmed binding stays ok when a session cookie only slides its expiry"
     now: 1_000,
     learnedConfirmed: false,
   });
-  assert.equal(decision.action, "ignore");
+  assert.equal(decision.action, "refresh-cookies");
+  assert.deepEqual(decision.authNames, []);
   assert.equal(decision.pendingUpdate, false);
   assert.equal(decision.status, "ok");
   const applied = applyDecision(initialRefreshState({
     bindings: { "example.com": binding },
-  }), { ...decision, site: "example.com" });
+  }), { ...decision, site: "example.com", learned: { auth: ["Hm_lpvt_site"], identity: ["sid"] }, now: 4_000 });
   assert.equal(applied.state.bindings["example.com"].status, "ok");
   assert.equal(applied.state.bindings["example.com"].pendingUpdate, false);
   assert.equal(applied.state.bindings["example.com"].paused, false);
+  assert.equal(applied.state.bindings["example.com"].learned, null);
+  assert.equal(applied.state.bindings["example.com"].lastRefreshedAt, 4_000);
+  const refreshed = refreshCookiesInPlace({
+    cookies: baseline,
+    localStorage: { token: "keep" },
+    sessionStorage: {},
+  }, live);
+  assert.equal(refreshed.prev, undefined);
+  assert.equal(refreshed.localStorage.token, "keep");
+  assert.equal(refreshed.cookies.find((item) => item.name === "sid").expirationDate, 5_000);
+  assert.deepEqual(cookieRefreshMeta({ savedAt: 10, canRollback: false }, decision, 4_000).authNames, []);
   assert.equal(unconfirmedFlushAction({
     binding,
     decision,
     baselineCookies: baseline,
     liveCookies: live,
-    storageChanged: false,
-  }), "skip");
+    storageChanged: true,
+  }), "refresh-cookies");
 
   const confirmed = evaluateLiveCookies({
     classification: { classified: true, source: "learned", auth: ["sid"], identity: ["uid"] },
@@ -842,7 +856,8 @@ test("unconfirmed binding stays ok when a session cookie only slides its expiry"
     now: 1_000,
     learnedConfirmed: true,
   });
-  assert.equal(confirmed.action, "write");
+  assert.equal(confirmed.action, "refresh-cookies");
+  assert.deepEqual(confirmed.authNames, ["sid"]);
 });
 
 test("unconfirmed binding stays ok when only an analytics cookie changes", () => {
@@ -880,22 +895,165 @@ test("unconfirmed binding stays ok when only an analytics cookie changes", () =>
     now: 1_000,
     learnedConfirmed: false,
   });
-  assert.equal(decision.action, "ignore");
-  assert.equal(decision.write, false);
+  assert.equal(decision.action, "refresh-cookies");
+  assert.deepEqual(decision.authNames, []);
   assert.equal(decision.pendingUpdate, false);
   assert.equal(decision.status, "ok");
   const applied = applyDecision(initialRefreshState({
     bindings: { "example.com": binding },
-  }), { ...decision, site: "example.com" });
+  }), { ...decision, site: "example.com", now: 4_000 });
   assert.equal(applied.state.bindings["example.com"].status, "ok");
   assert.equal(applied.state.bindings["example.com"].pendingUpdate, false);
   assert.equal(applied.state.bindings["example.com"].paused, false);
   assert.equal(applied.state.bindings["example.com"].learned, null);
+  assert.equal(applied.state.bindings["example.com"].lastRefreshedAt, 4_000);
   assert.equal(unconfirmedFlushAction({
     binding,
     decision,
     baselineCookies: baseline,
     liveCookies: live,
     storageChanged: false,
-  }), "skip");
+  }), "refresh-cookies");
+});
+
+test("unconfirmed expiry slide writes cookies in place and a sid value change stays pending", () => {
+  const binding = {
+    site: "example.com",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  const baseline = [
+    cookie("sid", "same-sid", { expirationDate: 1_000, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+  ];
+  const slid = [
+    cookie("sid", "same-sid", { expirationDate: 5_000, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+  ];
+  const slidDecision = evaluateLiveCookies({
+    classification: resolveClassification({
+      siteKey: "example.com",
+      baseline,
+      live: slid,
+      builtin: {},
+      user: {},
+      learned: null,
+    }),
+    baseline,
+    live: slid,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(slidDecision.action, "refresh-cookies");
+  assert.deepEqual(slidDecision.authNames, []);
+  assert.equal(slidDecision.status, "ok");
+  const capture = { cookies: baseline, localStorage: { token: "a" }, sessionStorage: { tab: "1" } };
+  const refreshed = refreshCookiesInPlace(capture, slid);
+  assert.equal(refreshed.prev, undefined);
+  assert.equal(refreshed.localStorage.token, "a");
+  assert.equal(refreshed.sessionStorage.tab, "1");
+  assert.equal(refreshed.cookies.find((item) => item.name === "sid").expirationDate, 5_000);
+  const meta = cookieRefreshMeta({ savedAt: 20, canRollback: false }, slidDecision, 8_000);
+  assert.equal(meta.lastRefreshedAt, 8_000);
+  assert.equal(meta.canRollback, false);
+  assert.deepEqual(meta.authNames, []);
+  const applied = applyDecision(initialRefreshState({
+    bindings: { "example.com": binding },
+  }), { ...slidDecision, site: "example.com", now: 8_000 });
+  assert.equal(applied.state.bindings["example.com"].learned, null);
+  assert.equal(applied.state.bindings["example.com"].status, "ok");
+  assert.equal(applied.state.bindings["example.com"].lastRefreshedAt, 8_000);
+
+  const switched = [
+    cookie("sid", "other-sid", { expirationDate: 5_000, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+  ];
+  const switchedDecision = evaluateLiveCookies({
+    classification: resolveClassification({
+      siteKey: "example.com",
+      baseline,
+      live: switched,
+      builtin: {},
+      user: {},
+      learned: null,
+    }),
+    baseline,
+    live: switched,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(switchedDecision.action, "pending");
+  assert.equal(switchedDecision.status, "identity-unknown");
+  assert.equal(switchedDecision.pendingUpdate, true);
+  assert.notEqual(switchedDecision.action, "refresh-cookies");
+});
+
+test("confirmed expiry slide refreshes cookies in place and keeps the previous account", () => {
+  const accountA = {
+    cookies: [
+      cookie("sid", "A", { expirationDate: 100, domain: "example.com" }),
+      cookie("uid", "1", { expirationDate: 9_000, domain: "example.com" }),
+    ],
+    localStorage: { who: "A" },
+    sessionStorage: {},
+  };
+  const accountB = {
+    cookies: [
+      cookie("sid", "B", { expirationDate: 100, domain: "example.com" }),
+      cookie("uid", "1", { expirationDate: 9_000, domain: "example.com" }),
+    ],
+    localStorage: { who: "B" },
+    sessionStorage: {},
+  };
+  const updated = stageCapture(accountA, accountB);
+  assert.equal(updated.prev.cookies.find((item) => item.name === "sid").value, "A");
+  const learned = { auth: ["sid"], identity: ["uid"] };
+  const binding = {
+    site: "example.com",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned,
+  };
+  const live = updated.cookies.map((item) => (
+    item.name === "sid" ? { ...item, expirationDate: 800 } : item
+  ));
+  const decision = evaluateLiveCookies({
+    classification: resolveClassification({
+      siteKey: "example.com",
+      baseline: updated.cookies,
+      live,
+      builtin: {},
+      user: {},
+      learned,
+    }),
+    baseline: updated.cookies,
+    live,
+    now: 1_000,
+    learnedConfirmed: true,
+  });
+  assert.equal(decision.action, "refresh-cookies");
+  assert.deepEqual(decision.authNames, ["sid"]);
+  const refreshed = refreshCookiesInPlace(updated, live);
+  assert.equal(refreshed.cookies.find((item) => item.name === "sid").value, "B");
+  assert.equal(refreshed.cookies.find((item) => item.name === "sid").expirationDate, 800);
+  assert.equal(refreshed.prev.cookies.find((item) => item.name === "sid").value, "A");
+  assert.equal(refreshed.localStorage.who, "B");
+  const meta = cookieRefreshMeta({ savedAt: 30, canRollback: true }, decision, 9_000);
+  assert.equal(meta.canRollback, true);
+  assert.deepEqual(meta.authNames, ["sid"]);
+  const applied = applyDecision(initialRefreshState({
+    bindings: { "example.com": binding },
+  }), { ...decision, site: "example.com", learned: { auth: ["Hm_lpvt_x"], identity: ["sid"] }, now: 9_000 });
+  assert.deepEqual(applied.state.bindings["example.com"].learned, learned);
+  assert.equal(applied.state.bindings["example.com"].status, "ok");
+  assert.equal(applied.state.bindings["example.com"].pendingUpdate, false);
+  const rolled = rollbackCapture(refreshed);
+  assert.equal(rolled.canRollback, false);
+  assert.equal(rolled.capture.cookies.find((item) => item.name === "sid").value, "A");
+  assert.equal(rolled.capture.localStorage.who, "A");
 });

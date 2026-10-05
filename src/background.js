@@ -42,6 +42,7 @@ import {
   bindingFor,
   buildRefreshView,
   canRollbackCapture,
+  cookieRefreshMeta,
   COOKIE_RULES_KEY,
   createSiteBinding,
   evaluateLiveCookies,
@@ -52,6 +53,7 @@ import {
   learnedIsConfirmed,
   mergeStorageWhenUnconfirmed,
   reduceRefresh,
+  refreshCookiesInPlace,
   REFRESH_STATE_KEY,
   resolveClassification,
   rollbackCapture,
@@ -404,7 +406,15 @@ async function runAutoWrite(effect) {
   const learned = learnedConfirmed && classification.classified
     ? { auth: classification.auth, identity: classification.identity }
     : null;
-  if (action === "write") {
+  const refreshedAt = Date.now();
+  if (action === "refresh-cookies") {
+    await commitBoundCapture(
+      profile,
+      profiles,
+      refreshCookiesInPlace(capture, live),
+      cookieRefreshMeta(profile, decision, refreshedAt),
+    );
+  } else if (action === "write") {
     const staged = stageCapture(capture, {
       cookies: live,
       localStorage: capture.localStorage,
@@ -412,12 +422,18 @@ async function runAutoWrite(effect) {
     });
     await commitBoundCapture(profile, profiles, staged, {
       savedAt: profile.savedAt,
-      lastRefreshedAt: Date.now(),
+      lastRefreshedAt: refreshedAt,
       canRollback: true,
       authNames: classification.auth,
     });
   }
-  const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
+  const applied = applyDecision(refreshState, {
+    ...decision,
+    action,
+    site: binding.site,
+    learned: action === "refresh-cookies" ? null : learned,
+    now: refreshedAt,
+  });
   refreshState = applied.state;
   const written = bindingFor(refreshState, binding.site);
   if (action === "write" && written) {
@@ -534,6 +550,26 @@ async function flushBoundSnapshot(tab, binding) {
   const action = flushAction === "confirmed" ? decision.action : flushAction;
   if (action === "pending" || action === "pause" || action === "unbind") {
     const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
+    refreshState = applied.state;
+    await persistRefresh();
+    await updateBadge();
+    return;
+  }
+  if (action === "refresh-cookies") {
+    const refreshedAt = Date.now();
+    await commitBoundCapture(
+      profile,
+      profiles,
+      refreshCookiesInPlace(capture, live),
+      cookieRefreshMeta(profile, decision, refreshedAt),
+    );
+    const applied = applyDecision(refreshState, {
+      ...decision,
+      action,
+      site: binding.site,
+      learned: null,
+      now: refreshedAt,
+    });
     refreshState = applied.state;
     await persistRefresh();
     await updateBadge();

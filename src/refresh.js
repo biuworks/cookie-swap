@@ -422,6 +422,7 @@ export function unconfirmedFlushAction({
   ) {
     return "pending";
   }
+  if (decision?.action === "refresh-cookies") return "refresh-cookies";
   if (storageChanged) return "skip";
   return "skip";
 }
@@ -441,13 +442,24 @@ export function evaluateLiveCookies({
   const auth = classification?.auth || [];
   const identity = classification?.identity || [];
   const expiresAt = earliestKeyExpiryMs(live, auth);
-  const changed = learnedConfirmed === false
-    ? unconfirmedMaterialChange(baseline, live)
-    : materiallyChanged(baseline, live);
+  const namesChanged = unconfirmedMaterialChange(baseline, live);
+  const stampsChanged = materiallyChanged(baseline, live);
+  const changed = learnedConfirmed === false ? namesChanged : stampsChanged;
   const freshLearn = classification?.source === "learned" && learnedConfirmed === false;
 
   if (!classification?.classified || freshLearn) {
     if (!changed) {
+      if (learnedConfirmed === false && stampsChanged) {
+        return {
+          action: "refresh-cookies",
+          status: "ok",
+          pendingUpdate: false,
+          expiresAt: null,
+          write: true,
+          prompt: null,
+          authNames: [],
+        };
+      }
       return { action: "ignore", status: "ok", pendingUpdate: false, expiresAt, write: false, prompt: null };
     }
     return {
@@ -493,8 +505,20 @@ export function evaluateLiveCookies({
     };
   }
 
-  if (!changed) {
+  if (!stampsChanged) {
     return { action: "ignore", status: "ok", pendingUpdate: false, expiresAt, write: false, prompt: null };
+  }
+
+  if (!namesChanged) {
+    return {
+      action: "refresh-cookies",
+      status: "ok",
+      pendingUpdate: false,
+      expiresAt,
+      write: true,
+      prompt: null,
+      authNames: auth,
+    };
   }
 
   return { action: "write", status: "ok", pendingUpdate: false, expiresAt, write: true, prompt: null };
@@ -539,6 +563,35 @@ function cloneCookies(cookies) {
 
 function cloneStorage(storage) {
   return { ...(storage || {}) };
+}
+
+/**
+ * 只改当前这份 Cookie 和刷新时间。prev 原样留下，不另开一层回滚。
+ * 用在过期时间滑动或统计 Cookie 变化，名字和值都没变的时候。
+ */
+export function refreshCookiesInPlace(capture, live) {
+  const next = {
+    cookies: cloneCookies(live),
+    localStorage: cloneStorage(capture?.localStorage),
+    sessionStorage: cloneStorage(capture?.sessionStorage),
+  };
+  if (capture?.prev && Array.isArray(capture.prev.cookies)) {
+    next.prev = {
+      cookies: cloneCookies(capture.prev.cookies),
+      localStorage: cloneStorage(capture.prev.localStorage),
+      sessionStorage: cloneStorage(capture.prev.sessionStorage),
+    };
+  }
+  return next;
+}
+
+export function cookieRefreshMeta(profile, decision, now) {
+  return {
+    savedAt: profile?.savedAt,
+    lastRefreshedAt: now,
+    canRollback: profile?.canRollback === true,
+    authNames: Array.isArray(decision?.authNames) ? decision.authNames : [],
+  };
 }
 
 /** 只保留一层上一版。再写一次会丢掉更早的那版。 */
@@ -743,6 +796,21 @@ export function applyDecision(state, decision) {
         learned: decision.learned || binding.learned || null,
         lastRefreshedAt: decision.now ?? binding.lastRefreshedAt,
       }, { writeCount: state.writeCount + 1, notices: withoutKey(state.notices, site) }),
+      committed: true,
+    };
+  }
+  if (decision.action === "refresh-cookies") {
+    const keepExpiry = Array.isArray(decision.authNames) && decision.authNames.length > 0;
+    return {
+      state: withBinding(state, site, {
+        ...binding,
+        status: "ok",
+        pendingUpdate: false,
+        paused: false,
+        learned: binding.learned || null,
+        expiresAt: keepExpiry ? (decision.expiresAt ?? binding.expiresAt ?? null) : (binding.expiresAt ?? null),
+        lastRefreshedAt: decision.now ?? binding.lastRefreshedAt,
+      }),
       committed: true,
     };
   }
