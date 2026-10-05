@@ -5,14 +5,18 @@ import {
   applyDecision,
   assessKeyCookieExpiry,
   BUILTIN_SITE_RULES,
+  bindingFor,
   buildRefreshView,
   debounceDelay,
   evaluateLiveCookies,
   FLUSH_SCRIPT_ID,
   hydrateRefreshState,
+  ingestCookieChange,
   initialRefreshState,
+  learnedIsConfirmed,
   MAX_WAIT_MS,
   reduceRefresh,
+  resetFlushScriptCache,
   resolveClassification,
   rollbackCapture,
   stageCapture,
@@ -487,6 +491,7 @@ test("locking one site leaves the other site's debounce and writeback on time", 
 });
 
 test("flush script matches only bound origins, updates on unbind, and unregisters when none remain", async () => {
+  resetFlushScriptCache();
   const calls = [];
   const scripting = {
     async unregisterContentScripts(details) {
@@ -506,6 +511,8 @@ test("flush script matches only bound origins, updates on unbind, and unregister
   };
 
   await syncFlushScript(scripting, bindings);
+  const again = await syncFlushScript(scripting, bindings);
+  assert.equal(again.skipped, true);
   const registered = calls.filter((call) => call.op === "register");
   assert.equal(registered.length, 1);
   assert.deepEqual(registered[0].ids, [FLUSH_SCRIPT_ID]);
@@ -526,7 +533,149 @@ test("flush script matches only bound origins, updates on unbind, and unregister
   assert.equal(calls.some((call) => call.op === "unregister" && call.ids.includes(FLUSH_SCRIPT_ID)), true);
   assert.equal(calls.some((call) => call.op === "register"), false);
 
+  resetFlushScriptCache();
+  const failing = {
+    async unregisterContentScripts() {
+      throw new Error("unregister failed");
+    },
+    async registerContentScripts() {
+      throw new Error("register failed");
+    },
+  };
+  const failed = await syncFlushScript(failing, bindings);
+  assert.equal(failed.failed, true);
+
   const background = fs.readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   assert.match(background, /syncFlushScript\(chrome\.scripting,\s*refreshState\.bindings\)/);
   assert.doesNotMatch(background, /https?:\/\/\*\/\*/);
+});
+
+test("a cookie event that arrives before hydrate debounces the restored binding", async () => {
+  let release;
+  const hydrate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let state = initialRefreshState();
+  let applied = 0;
+  const pending = ingestCookieChange({
+    hydrate,
+    at: 1_000,
+    site: "example.com",
+    storeId: "store-1",
+    readBinding: (site) => bindingFor(state, site),
+    apply(event) {
+      applied += 1;
+      const result = reduceRefresh(state, event);
+      state = result.state;
+      return result;
+    },
+  });
+  await Promise.resolve();
+  assert.equal(applied, 0, "hydrate 完成前不能按空绑定处理");
+
+  state = initialRefreshState({
+    bindings: {
+      "example.com": {
+        site: "example.com",
+        snapshotId: "acc-a",
+        status: "ok",
+        paused: false,
+        storeId: "store-1",
+      },
+    },
+  });
+  release();
+  const result = await pending;
+  assert.equal(applied, 1);
+  assert.notEqual(result.effect.type, "ignore-unbound");
+  assert.equal(result.effect.type, "schedule");
+  assert.equal(result.effect.snapshotId, "acc-a");
+  assert.equal(state.debounces["example.com"].startedAt, 1_000);
+
+  const background = fs.readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const cookieHandler = background.slice(
+    background.indexOf("async function handleCookieChanged"),
+    background.indexOf("async function flushBoundSnapshot"),
+  );
+  const flushHandler = background.slice(
+    background.indexOf("async function flushStorageMessage"),
+    background.indexOf("async function bindProfile"),
+  );
+  assert.ok(cookieHandler.indexOf("const at = Date.now()") < cookieHandler.indexOf("ensureHydrated()"));
+  assert.match(cookieHandler, /ingestCookieChange\(/);
+  assert.match(flushHandler, /await ensureHydrated\(\)/);
+  assert.match(background.slice(
+    background.indexOf("async function mergeBoundStorage"),
+    background.indexOf("async function flushStorageMessage"),
+  ), /await ensureHydrated\(\)/);
+});
+
+test("an unconfirmed learned rotation does not write account B over account A", () => {
+  const baseline = [
+    cookie("sid", "a-sid", { session: true, domain: "shop.test" }),
+    cookie("uid", "a-uid", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("_ga", "GA1.2.1.1", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("lang", "zh", { expirationDate: 9_000, domain: "shop.test" }),
+  ];
+  const live = [
+    cookie("sid", "b-sid", { session: true, domain: "shop.test" }),
+    cookie("uid", "b-uid", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("_ga", "GA1.2.1.1", { expirationDate: 9_000, domain: "shop.test" }),
+    cookie("lang", "zh", { expirationDate: 9_000, domain: "shop.test" }),
+  ];
+  const classification = resolveClassification({
+    siteKey: "shop.test",
+    baseline,
+    live,
+    builtin: {},
+    user: {},
+    learned: null,
+  });
+  assert.equal(classification.source, "learned");
+  assert.deepEqual(classification.auth.sort(), ["sid", "uid"]);
+  assert.deepEqual(classification.identity.sort(), ["_ga", "lang"]);
+
+  const binding = {
+    site: "shop.test",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  assert.equal(learnedIsConfirmed(binding), false);
+  const decision = evaluateLiveCookies({
+    classification,
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: learnedIsConfirmed(binding),
+  });
+  assert.equal(decision.action, "pending");
+  assert.equal(decision.write, false);
+  assert.equal(decision.status, "identity-unknown");
+  assert.equal(decision.pendingUpdate, true);
+
+  const applied = applyDecision(initialRefreshState({
+    bindings: { "shop.test": binding },
+  }), {
+    ...decision,
+    site: "shop.test",
+    learned: { auth: classification.auth, identity: classification.identity },
+  });
+  assert.equal(applied.committed, false);
+  assert.equal(applied.state.writeCount, 0);
+  assert.equal(applied.state.bindings["shop.test"].status, "identity-unknown");
+  assert.equal(applied.state.bindings["shop.test"].pendingUpdate, true);
+  assert.equal(applied.state.bindings["shop.test"].learned, null);
+
+  const confirmed = evaluateLiveCookies({
+    classification,
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: true,
+  });
+  assert.equal(confirmed.action, "write");
+  assert.equal(confirmed.write, true);
 });

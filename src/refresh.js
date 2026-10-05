@@ -123,26 +123,66 @@ export function flushScriptMatches(bindings) {
   return matches;
 }
 
-/** 按当前绑定重注册页面关闭脚本。没有绑定时只注销，不再对全网注入。 */
+let flushScriptSignature = null;
+
+export function resetFlushScriptCache() {
+  flushScriptSignature = null;
+}
+
+/** 按当前绑定重注册页面关闭脚本。matches 没变就跳过；注册失败留在这里，不抛给弹窗。 */
 export async function syncFlushScript(scripting, bindings) {
   const matches = flushScriptMatches(bindings);
+  const signature = matches.join("\n");
+  if (flushScriptSignature === signature) {
+    return { matches, unregistered: matches.length === 0, skipped: true };
+  }
   if (!scripting?.unregisterContentScripts && !scripting?.registerContentScripts) {
-    return { matches, unregistered: matches.length === 0 };
+    return { matches, unregistered: matches.length === 0, skipped: false };
   }
-  if (scripting.unregisterContentScripts) {
-    await scripting.unregisterContentScripts({ ids: [FLUSH_SCRIPT_ID] }).catch(() => {});
+  try {
+    if (matches.length === 0) {
+      if (scripting.unregisterContentScripts) {
+        await scripting.unregisterContentScripts({ ids: [FLUSH_SCRIPT_ID] });
+      }
+      flushScriptSignature = signature;
+      return { matches, unregistered: true, skipped: false };
+    }
+    if (scripting.unregisterContentScripts) {
+      await scripting.unregisterContentScripts({ ids: [FLUSH_SCRIPT_ID] }).catch(() => {});
+    }
+    if (!scripting.registerContentScripts) {
+      return { matches, unregistered: true, skipped: false };
+    }
+    await scripting.registerContentScripts([{
+      id: FLUSH_SCRIPT_ID,
+      matches,
+      js: ["src/page-hide.js"],
+      runAt: "document_start",
+      persistAcrossSessions: true,
+    }]);
+    flushScriptSignature = signature;
+    return { matches, unregistered: false, skipped: false };
+  } catch {
+    return { matches, unregistered: matches.length === 0, skipped: false, failed: true };
   }
-  if (matches.length === 0 || !scripting.registerContentScripts) {
-    return { matches, unregistered: true };
+}
+
+/**
+ * 等绑定从 storage 恢复后再判定这次 Cookie 变化。
+ * `at` 由调用方在等待之前记下，防抖起点不跟着 hydrate 往后推。
+ */
+export async function ingestCookieChange({ hydrate, at, site, storeId, readBinding, apply }) {
+  await hydrate;
+  const binding = readBinding(site);
+  if (binding?.storeId && storeId && storeId !== binding.storeId) {
+    return { effect: { type: "ignore-store", site, writeCount: 0 } };
   }
-  await scripting.registerContentScripts([{
-    id: FLUSH_SCRIPT_ID,
-    matches,
-    js: ["src/page-hide.js"],
-    runAt: "document_start",
-    persistAcrossSessions: true,
-  }]);
-  return { matches, unregistered: false };
+  return apply({
+    type: "cookie",
+    at,
+    site,
+    snapshotId: binding?.snapshotId || null,
+  });
 }
 
 export function debounceDelay(startedAt, now, trailMs = TRAIL_MS, maxWaitMs = MAX_WAIT_MS) {
@@ -322,13 +362,30 @@ export function assessKeyCookieExpiry(cookies, authNames, now = Date.now()) {
   };
 }
 
-export function evaluateLiveCookies({ classification, baseline, live, now = Date.now() }) {
+/** 用户点过更新（或保存/切换时已经按内置、手动规则确认）之后，learned 才会留在绑定上。 */
+export function learnedIsConfirmed(binding) {
+  const learned = binding?.learned;
+  return Boolean(
+    learned
+    && Array.isArray(learned.auth) && learned.auth.length > 0
+    && Array.isArray(learned.identity) && learned.identity.length > 0,
+  );
+}
+
+export function evaluateLiveCookies({
+  classification,
+  baseline,
+  live,
+  now = Date.now(),
+  learnedConfirmed = true,
+} = {}) {
   const auth = classification?.auth || [];
   const identity = classification?.identity || [];
   const expiresAt = earliestKeyExpiryMs(live, auth);
   const changed = materiallyChanged(baseline, live);
+  const freshLearn = classification?.source === "learned" && learnedConfirmed === false;
 
-  if (!classification?.classified) {
+  if (!classification?.classified || freshLearn) {
     if (!changed) {
       return { action: "ignore", status: "ok", pendingUpdate: false, expiresAt, write: false, prompt: null };
     }

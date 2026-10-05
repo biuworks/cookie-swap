@@ -46,8 +46,10 @@ import {
   createSiteBinding,
   evaluateLiveCookies,
   hydrateRefreshState,
+  ingestCookieChange,
   initialRefreshState,
   keyExpiryTimes,
+  learnedIsConfirmed,
   reduceRefresh,
   REFRESH_STATE_KEY,
   resolveClassification,
@@ -387,17 +389,20 @@ async function runAutoWrite(effect) {
   const storeId = binding.storeId;
   if (!storeId) return;
   const live = await readLiveCookies(binding.site, profile.origin, storeId);
+  const learnedConfirmed = learnedIsConfirmed(binding);
   const classification = await classifyLive(binding.site, capture.cookies, live, binding.learned);
   const decision = evaluateLiveCookies({
     classification,
     baseline: capture.cookies,
     live,
     now: Date.now(),
+    learnedConfirmed,
   });
-  const learned = classification.classified
+  const action = decision.action === "write" && !learnedConfirmed ? "pending" : decision.action;
+  const learned = learnedConfirmed && classification.classified
     ? { auth: classification.auth, identity: classification.identity }
     : null;
-  if (decision.action === "write") {
+  if (action === "write") {
     const staged = stageCapture(capture, {
       cookies: live,
       localStorage: capture.localStorage,
@@ -410,10 +415,10 @@ async function runAutoWrite(effect) {
       authNames: classification.auth,
     });
   }
-  const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
+  const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
   refreshState = applied.state;
   const written = bindingFor(refreshState, binding.site);
-  if (decision.action === "write" && written) {
+  if (action === "write" && written) {
     refreshState = {
       ...refreshState,
       bindings: {
@@ -445,20 +450,28 @@ function cookieSite(cookie) {
   }
 }
 
-function handleCookieChanged(info) {
+async function handleCookieChanged(info) {
+  const at = Date.now();
   const cookie = info?.cookie;
-  if (!cookie?.domain || !cookieBelongsToSite(cookie.domain, cookieSite(cookie))) return;
+  if (!cookie?.domain) return;
   const site = cookieSite(cookie);
-  if (!site) return;
-  const binding = bindingFor(refreshState, site);
-  if (binding?.storeId && cookie.storeId && cookie.storeId !== binding.storeId) return;
-  const result = applyRefresh({
-    type: "cookie",
-    at: Date.now(),
-    site,
-    snapshotId: binding?.snapshotId || null,
-  });
-  if (result.effect.type === "write") enqueue(() => runAutoWrite(result.effect));
+  if (!site || !cookieBelongsToSite(cookie.domain, site)) return;
+  try {
+    await ingestCookieChange({
+      hydrate: ensureHydrated(),
+      at,
+      site,
+      storeId: cookie.storeId,
+      readBinding: (key) => bindingFor(refreshState, key),
+      apply: (event) => {
+        const result = applyRefresh(event);
+        if (result.effect.type === "write") enqueue(() => runAutoWrite(result.effect));
+        return result;
+      },
+    });
+  } catch {
+    // 单次 Cookie 变化失败不影响后面的事件。
+  }
 }
 
 async function flushBoundSnapshot(tab, binding) {
@@ -494,48 +507,65 @@ async function flushBoundSnapshot(tab, binding) {
   } catch {
     // Cookie 仍然可以按当前库写回；存储读不到就留着上一份。
   }
+  const learnedConfirmed = learnedIsConfirmed(binding);
   const classification = await classifyLive(binding.site, capture.cookies, live, binding.learned);
   const decision = evaluateLiveCookies({
     classification,
     baseline: capture.cookies,
     live,
     now: Date.now(),
+    learnedConfirmed,
   });
-  const learned = classification.classified
+  const learned = learnedConfirmed && classification.classified
     ? { auth: classification.auth, identity: classification.identity }
     : null;
-  if (decision.action === "pending" || decision.action === "pause" || decision.action === "unbind") {
-    const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
+  const storageChanged = JSON.stringify(localStorage) !== JSON.stringify(capture.localStorage || {})
+    || JSON.stringify(sessionStorage) !== JSON.stringify(capture.sessionStorage || {});
+  const action = !learnedConfirmed && (decision.action === "write" || decision.pendingUpdate || storageChanged)
+    ? "pending"
+    : decision.action;
+  if (action === "pending" || action === "pause" || action === "unbind") {
+    const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
     refreshState = applied.state;
     await persistRefresh();
     await updateBadge();
     return;
   }
-  const storageChanged = JSON.stringify(localStorage) !== JSON.stringify(capture.localStorage || {})
-    || JSON.stringify(sessionStorage) !== JSON.stringify(capture.sessionStorage || {});
-  if (decision.action !== "write" && !storageChanged) return;
+  if (action !== "write" && !storageChanged) return;
   const staged = stageCapture(capture, {
-    cookies: decision.action === "write" ? live : capture.cookies,
+    cookies: action === "write" ? live : capture.cookies,
     localStorage,
     sessionStorage,
   });
   await commitBoundCapture(profile, profiles, staged, {
     savedAt: profile.savedAt,
-    lastRefreshedAt: decision.action === "write" ? Date.now() : (profile.lastRefreshedAt || profile.savedAt),
+    lastRefreshedAt: action === "write" ? Date.now() : (profile.lastRefreshedAt || profile.savedAt),
     canRollback: true,
     authNames: classification.auth,
   });
-  const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
+  const applied = applyDecision(refreshState, { ...decision, action, site: binding.site, learned, now: Date.now() });
   refreshState = applied.state;
   await persistRefresh();
   await updateBadge();
 }
 
 async function mergeBoundStorage(siteKey, storage) {
+  await ensureHydrated();
   if (siteLocked(refreshState, siteKey)) return;
   const binding = bindingFor(refreshState, siteKey);
   if (!binding?.snapshotId) return;
   if (binding.paused || binding.status === "identity-unknown" || binding.status === "maybe-logged-out") return;
+  if (!learnedIsConfirmed(binding)) {
+    const applied = applyDecision(refreshState, {
+      action: "pending",
+      site: siteKey,
+      expiresAt: binding.expiresAt ?? null,
+    });
+    refreshState = applied.state;
+    await persistRefresh();
+    await updateBadge();
+    return;
+  }
   const capture = await readProfileCapture(binding.snapshotId);
   if (!capture) return;
   const next = {
@@ -555,6 +585,7 @@ async function mergeBoundStorage(siteKey, storage) {
 }
 
 async function flushStorageMessage(message, sender) {
+  await ensureHydrated();
   const href = message?.href || sender?.tab?.url || "";
   const target = readPageTarget(href);
   if (!target.ok) return;
