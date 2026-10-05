@@ -23,6 +23,16 @@ const state = {
   loggedIn: true,
   profiles: [],
   activeId: null,
+  boundProfileId: null,
+  status: null,
+  statusLabel: "",
+  pendingUpdate: false,
+  expiresAt: null,
+  canRollback: false,
+  lastRefreshedAt: null,
+  refreshLabel: "",
+  expiryLabel: "",
+  prompt: null,
   busy: false,
   busyId: null,
   menuId: null,
@@ -121,6 +131,9 @@ function createChromeRuntime() {
     async fresh(confirmed) {
       return send({ type: "fresh", tabId: await tabId(), confirmed: Boolean(confirmed) });
     },
+    async rollback(profileId) {
+      return send({ type: "rollback", tabId: await tabId(), profileId });
+    },
   };
 }
 
@@ -128,17 +141,47 @@ function createChromeRuntime() {
  *  加 ?onboard=1 预览首次安装那一屏。 */
 function createPreviewRuntime() {
   const now = Date.now();
-  let onboarded = !/[?&]onboard=1/.test(globalThis.location?.search || "");
+  const search = globalThis.location?.search || "";
+  const flag = (name) => new RegExp(`[?&]${name}=1`).test(search);
+  let onboarded = !flag("onboard");
+  const pending = flag("pending");
+  const unbound = flag("unbound");
+  const showRollback = flag("rollback");
+  const loggedOut = flag("logout");
+  const saveAs = flag("saveas");
+  const stale = flag("stale");
+  let canRollback = showRollback;
+  let boundProfileId = unbound || saveAs ? null : "work";
+  let pendingUpdate = pending;
+  let status = pending
+    ? "identity-unknown"
+    : loggedOut
+      ? "maybe-logged-out"
+      : saveAs
+        ? "identity-changed"
+        : "ok";
+  let statusLabel = pending
+    ? "该站无法识别换号"
+    : loggedOut
+      ? "可能已登出"
+      : saveAs
+        ? "另存为新账号？"
+        : "";
+  let prompt = saveAs ? "save-as-new" : null;
   let profiles = [
     {
       id: "work", name: "工作号", savedAt: now - 5 * 60 * 1000,
       origin: "https://shop.example.com", hostLabel: "shop.example.com",
-      cookieCount: 8, storageCount: 3, expiredCount: 0, active: true,
+      cookieCount: 8, storageCount: 3, expiredCount: 0, active: !(unbound || saveAs),
+      refreshLabel: stale ? "9天未刷新" : "",
+      expiryLabel: stale ? "将于10月9日过期" : "",
     },
     {
       id: "personal", name: "个人号", savedAt: now - 26 * 60 * 60 * 1000,
       origin: "https://shop.example.com", hostLabel: "shop.example.com",
       cookieCount: 6, storageCount: 1, expiredCount: 3, active: false,
+      refreshLabel: "",
+      expiryLabel: "",
     },
   ];
   const removed = [];
@@ -149,6 +192,16 @@ function createPreviewRuntime() {
       hostLabel: "shop.example.com",
       origin: "https://shop.example.com",
       loggedIn,
+      boundProfileId,
+      status,
+      statusLabel,
+      pendingUpdate: Boolean(boundProfileId && pendingUpdate),
+      expiresAt: loggedOut ? now - 1000 : null,
+      canRollback: Boolean(boundProfileId && canRollback),
+      lastRefreshedAt: now,
+      refreshLabel: stale ? "9天未刷新" : "",
+      expiryLabel: stale ? "将于10月9日过期" : "",
+      prompt,
       profiles: profiles.map((profile) => ({ ...profile })),
     },
   });
@@ -207,7 +260,18 @@ function createPreviewRuntime() {
     },
     async fresh() {
       profiles = profiles.map((profile) => ({ ...profile, active: false }));
+      boundProfileId = null;
+      pendingUpdate = false;
+      canRollback = false;
+      status = null;
+      statusLabel = "";
+      prompt = null;
       return { ...view(false), effect: { type: "fresh" } };
+    },
+    async rollback(profileId) {
+      const profile = profiles.find((item) => item.id === profileId);
+      canRollback = false;
+      return { ...view(), effect: { type: "rolled-back", name: profile?.name || "" } };
     },
   };
 }
@@ -227,6 +291,16 @@ function applyView(view) {
   state.reason = view.reason || "";
   state.profiles = Array.isArray(view.profiles) ? view.profiles : [];
   state.loggedIn = view.loggedIn !== false;
+  state.boundProfileId = view.boundProfileId || null;
+  state.status = view.status || null;
+  state.statusLabel = view.statusLabel || "";
+  state.pendingUpdate = view.pendingUpdate === true;
+  state.expiresAt = typeof view.expiresAt === "number" ? view.expiresAt : null;
+  state.canRollback = view.canRollback === true;
+  state.lastRefreshedAt = typeof view.lastRefreshedAt === "number" ? view.lastRefreshedAt : null;
+  state.refreshLabel = view.refreshLabel || "";
+  state.expiryLabel = view.expiryLabel || "";
+  state.prompt = view.prompt || null;
   const active = state.profiles.find((profile) => profile.active);
   state.activeId = active ? active.id : null;
   state.menuId = null;
@@ -240,14 +314,20 @@ function avatarHtml(profile) {
   return `<span class="av" style="background:${avatarColor(profile.name)}">${esc(initialOf(profile.name))}</span>`;
 }
 
+function freshnessText(profile) {
+  return [profile.refreshLabel, profile.expiryLabel].filter(Boolean).join(" · ");
+}
+
 function subHtml(profile) {
   const when = profileMeta(profile);
+  const freshness = freshnessText(profile);
+  const extra = freshness ? ` · ${freshness}` : "";
   if (profile.expiredCount > 0) {
     return `<div class="sub is-warn" data-act="detail" data-id="${profile.id}" role="button" tabindex="0"`
       + ` aria-expanded="${state.detailId === profile.id}" title="有凭证已过期，点开看详情">`
-      + `${esc(when)} · <b>${profile.expiredCount} 项凭证已过期</b>${ICON.caret}</div>`;
+      + `${esc(when + extra)} · <b>${profile.expiredCount} 项凭证已过期</b>${ICON.caret}</div>`;
   }
-  return `<div class="sub" title="${esc(formatSavedAtExact(profile.savedAt))}">${esc(when)}</div>`;
+  return `<div class="sub" title="${esc(formatSavedAtExact(profile.savedAt))}">${esc(when + extra)}</div>`;
 }
 
 function detailHtml(profile) {
@@ -389,8 +469,13 @@ function bodyHtml() {
     html += barHtml(false, "<b>当前页面未登录</b> · 先登录才能保存新快照");
   } else if (current) {
     html += statusCardHtml(current);
+  } else if (state.prompt === "save-as-new") {
+    html += barHtml(true, `<b>${esc(state.statusLabel || "另存为新账号？")}</b>`);
   } else {
     html += barHtml(true, "<b>当前页面的登录态还没保存</b> · 点下面保存成快照");
+  }
+  if (state.boundProfileId && state.statusLabel) {
+    html += `<div class="hintline is-warn">${esc(state.statusLabel)}</div>`;
   }
   if (state.draftOpen) html += draftHtml();
   html += "</div>";
@@ -415,15 +500,23 @@ function footHtml() {
   }
   if (state.phase !== "ready") return "";
   const lock = state.busy ? " disabled" : "";
-  const current = currentProfile();
-  if (current) {
-    return `<button class="btn primary" data-act="update" data-id="${current.id}" type="button"${lock}>`
-      + `${ICON.refresh}更新「${esc(current.name)}」</button>`
+  const bound = state.boundProfileId
+    ? state.profiles.find((profile) => profile.id === state.boundProfileId)
+    : null;
+  if (bound) {
+    const label = state.pendingUpdate ? "检测到新登录态，点击更新" : `更新「${bound.name}」`;
+    const rollback = state.canRollback
+      ? `<button class="btn sec" data-act="rollback" data-id="${bound.id}" type="button"${lock}>回滚上一版</button>`
+      : "";
+    return `<button class="btn primary" data-act="update" data-id="${bound.id}" type="button"${lock}>`
+      + `${ICON.refresh}${esc(label)}</button>`
+      + rollback
       + `<button class="btn sec" data-act="fresh" type="button"${lock}>${ICON.swap}换个号</button>`;
   }
   if (state.loggedIn) {
+    const saveLabel = state.prompt === "save-as-new" ? "另存为新账号" : "保存当前登录";
     return `<button class="btn primary" data-act="open-draft" type="button"${lock}>`
-      + `${ICON.plus}保存当前登录</button>`
+      + `${ICON.plus}${esc(saveLabel)}</button>`
       + `<button class="btn sec" data-act="fresh" type="button"${lock}>${ICON.swap}换个号</button>`;
   }
   return `<button class="btn primary" data-act="fresh" type="button">${ICON.swap}登录新账号</button>`
@@ -686,6 +779,10 @@ document.addEventListener("click", (event) => {
 
   if (act === "update") {
     run(() => runtime.update(id));
+    return;
+  }
+  if (act === "rollback") {
+    run(() => runtime.rollback(id));
     return;
   }
   if (act === "switch") {

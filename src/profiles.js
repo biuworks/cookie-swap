@@ -17,7 +17,12 @@ export function toListRecord(profile, now = profile?.savedAt) {
     siteKey: profile.siteKey,
     origin: profile.origin,
     hostLabel: profile.hostLabel,
-    savedAt: now,
+    savedAt: typeof profile.savedAt === "number" ? profile.savedAt : now,
+    lastRefreshedAt: typeof profile.lastRefreshedAt === "number" ? profile.lastRefreshedAt : now,
+    canRollback: profile.canRollback === true,
+    keyExpiryTimes: Array.isArray(profile.keyExpiryTimes)
+      ? profile.keyExpiryTimes.filter((time) => typeof time === "number")
+      : [],
     cookieCount: profile.cookies?.length || 0,
     storageCount: Object.keys(profile.localStorage || {}).length + Object.keys(profile.sessionStorage || {}).length,
     expiryTimes: expirationTimes(profile.cookies),
@@ -197,6 +202,11 @@ export async function readProfileCapture(id) {
     cookies: capture.cookies,
     localStorage: capture.localStorage || {},
     sessionStorage: capture.sessionStorage || {},
+    prev: capture.prev && Array.isArray(capture.prev.cookies) ? {
+      cookies: capture.prev.cookies,
+      localStorage: capture.prev.localStorage || {},
+      sessionStorage: capture.prev.sessionStorage || {},
+    } : null,
   };
 }
 
@@ -211,6 +221,11 @@ export async function commitProfile(index, id, capture) {
       cookies: capture.cookies || [],
       localStorage: capture.localStorage || {},
       sessionStorage: capture.sessionStorage || {},
+      prev: capture.prev && Array.isArray(capture.prev.cookies) ? {
+        cookies: capture.prev.cookies,
+        localStorage: capture.prev.localStorage || {},
+        sessionStorage: capture.prev.sessionStorage || {},
+      } : null,
     },
   });
 }

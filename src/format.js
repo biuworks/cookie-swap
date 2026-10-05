@@ -37,6 +37,28 @@ export function profileMeta(profile, now = Date.now()) {
   return at === "刚刚" ? "刚刚保存" : `${at} 保存`;
 }
 
+/** 列表上的「N天未刷新」。不足一天不标。 */
+export function formatRefreshLabel(lastRefreshedAt, now = Date.now()) {
+  if (typeof lastRefreshedAt !== "number") return "";
+  const days = Math.floor((now - lastRefreshedAt) / 86_400_000);
+  if (days < 1) return "";
+  return `${days}天未刷新`;
+}
+
+/** 关键 Cookie 还没过期时标「将于某日过期」。已过期交给状态文案，这里留空。 */
+export function formatExpiryLabel(expiresAt, now = Date.now()) {
+  if (typeof expiresAt !== "number" || expiresAt <= now) return "";
+  const date = new Date(expiresAt);
+  return `将于${date.getMonth() + 1}月${date.getDate()}日过期`;
+}
+
+export function statusLabelFor(status) {
+  if (status === "identity-unknown") return "该站无法识别换号";
+  if (status === "maybe-logged-out") return "可能已登出";
+  if (status === "identity-changed") return "另存为新账号？";
+  return "";
+}
+
 /**
  * 把一次操作的结果翻译成给人看的一句话。
  * 这里只描述「已经发生了什么」；「要不要继续」这类提问由弹窗的确认面板负责。
@@ -52,6 +74,9 @@ export function describeEffect(effect) {
   }
   if (effect.type === "updated") {
     return { kind: "ok", text: `已用当前登录态更新「${effect.name}」` };
+  }
+  if (effect.type === "rolled-back") {
+    return { kind: "ok", text: `已把「${effect.name}」回滚到上一版` };
   }
   if (effect.type === "renamed") {
     return { kind: "ok", text: `已重命名为「${effect.name}」` };

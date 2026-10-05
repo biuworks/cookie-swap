@@ -241,3 +241,57 @@ test("profile names cannot inject markup", async () => {
 
   clickStatic(dom, "toast-close");
 });
+
+test("pending update and unrecognized sites are rendered from the view", async () => {
+  const dom = await boot({ search: "?pending=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /该站无法识别换号/);
+  assert.match(foot, /检测到新登录态，点击更新/);
+  assert.match(foot, /data-act="update"/);
+  assertButtonsWired(foot, "pending footer");
+});
+
+test("an unbound site does not offer update", async () => {
+  const dom = await boot({ search: "?unbound=1" });
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(foot, /保存当前登录/);
+  assert.doesNotMatch(foot, /更新/);
+  assert.doesNotMatch(foot, /data-act="update"/);
+  assert.doesNotMatch(foot, /data-act="rollback"/);
+});
+
+test("rollback is shown only while canRollback is true", async () => {
+  const dom = await boot({ search: "?rollback=1" });
+  assert.match(dom.elements.get("foot").innerHTML, /data-act="rollback"/);
+  click(dom, "rollback", "work");
+  await tick();
+  assert.match(dom.elements.get("toast-text").textContent, /回滚到上一版/);
+  assert.doesNotMatch(dom.elements.get("foot").innerHTML, /data-act="rollback"/);
+});
+
+test("maybe-logged-out keeps the bound account and shows the view label", async () => {
+  const dom = await boot({ search: "?logout=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /可能已登出/);
+  assert.match(foot, /data-act="update"/);
+  assert.match(foot, /更新「工作号」/);
+});
+
+test("saving over a changed identity uses the existing save action", async () => {
+  const dom = await boot({ search: "?saveas=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /另存为新账号？/);
+  assert.match(foot, /另存为新账号/);
+  assert.match(foot, /data-act="open-draft"/);
+  assert.doesNotMatch(foot, /data-act="update"/);
+});
+
+test("freshness labels are displayed as provided, not recomputed", async () => {
+  const dom = await boot({ search: "?stale=1" });
+  const body = dom.elements.get("body").innerHTML;
+  assert.match(body, /9天未刷新/);
+  assert.match(body, /将于10月9日过期/);
+});
