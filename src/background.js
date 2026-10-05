@@ -39,18 +39,22 @@ import {
   applyDecision,
   badgeCount,
   BUILTIN_SITE_RULES,
+  bindingFor,
   buildRefreshView,
   canRollbackCapture,
   COOKIE_RULES_KEY,
   createSiteBinding,
   evaluateLiveCookies,
+  hydrateRefreshState,
   initialRefreshState,
   keyExpiryTimes,
   reduceRefresh,
   REFRESH_STATE_KEY,
   resolveClassification,
   rollbackCapture,
+  siteLocked,
   stageCapture,
+  syncFlushScript,
   writebackBudgetRemaining,
 } from "./refresh.js";
 
@@ -235,7 +239,7 @@ async function writeActiveHint(siteKey, profileId) {
 */
 
 let refreshState = initialRefreshState();
-let refreshTimer = null;
+const refreshTimers = new Map();
 let refreshReady = Promise.resolve();
 
 function presentSite(target, profiles, activeId, now = Date.now(), loggedIn = true) {
@@ -248,15 +252,17 @@ function presentSite(target, profiles, activeId, now = Date.now(), loggedIn = tr
 }
 
 async function persistRefresh() {
-  if (!chrome.storage?.local?.set) return;
-  await chrome.storage.local.set({
-    [REFRESH_STATE_KEY]: {
-      locked: refreshState.locked,
-      binding: refreshState.binding,
-      notice: refreshState.notice,
-      generation: refreshState.generation,
-    },
-  });
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({
+      [REFRESH_STATE_KEY]: {
+        bindings: refreshState.bindings,
+        locks: refreshState.locks,
+        notices: refreshState.notices,
+        generations: refreshState.generations,
+      },
+    });
+  }
+  await syncFlushScript(chrome.scripting, refreshState.bindings);
 }
 
 async function readUserRules() {
@@ -273,47 +279,45 @@ function ensureHydrated() {
 function installRefresh() {
   refreshReady = (async () => {
     try {
-      if (!chrome.storage?.local?.get) return;
-      const stored = await chrome.storage.local.get(REFRESH_STATE_KEY);
-      const saved = stored?.[REFRESH_STATE_KEY];
-      if (!saved || typeof saved !== "object") return;
-      const locked = saved.locked === true;
-      refreshState = initialRefreshState({
-        locked: false,
-        binding: locked ? null : (saved.binding || null),
-        notice: saved.notice || null,
-        generation: typeof saved.generation === "number" ? saved.generation : 0,
-      });
-      if (locked) await persistRefresh();
+      if (chrome.storage?.local?.get) {
+        const stored = await chrome.storage.local.get(REFRESH_STATE_KEY);
+        const saved = stored?.[REFRESH_STATE_KEY];
+        const hydrated = hydrateRefreshState(saved);
+        refreshState = hydrated.state;
+        if (hydrated.changed) await persistRefresh();
+      }
     } catch {
       refreshState = initialRefreshState();
     }
+    await syncFlushScript(chrome.scripting, refreshState.bindings);
   })();
 }
 
-function clearRefreshTimer() {
-  if (refreshTimer) {
-    clearTimeout(refreshTimer);
-    refreshTimer = null;
-  }
+function clearSiteTimer(site) {
+  const timer = refreshTimers.get(site);
+  if (!timer) return;
+  clearTimeout(timer);
+  refreshTimers.delete(site);
 }
 
 function applyRefresh(event) {
   const result = reduceRefresh(refreshState, event);
   refreshState = result.state;
+  const site = result.effect.site || event.site;
   if (result.effect.type === "schedule") {
-    clearRefreshTimer();
+    clearSiteTimer(site);
     const generation = result.effect.generation;
     const delay = result.effect.delay;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = null;
-      const timed = applyRefresh({ type: "timer", at: Date.now(), generation });
+    const timer = setTimeout(() => {
+      refreshTimers.delete(site);
+      const timed = applyRefresh({ type: "timer", at: Date.now(), generation, site });
       if (timed.effect.type === "write") enqueue(() => runAutoWrite(timed.effect));
     }, delay);
+    refreshTimers.set(site, timer);
     return result;
   }
-  if (result.effect.type === "cancel" || result.effect.type === "write" || result.effect.type === "drop") {
-    clearRefreshTimer();
+  if (site && (result.effect.type === "cancel" || result.effect.type === "write" || result.effect.type === "drop")) {
+    clearSiteTimer(site);
   }
   return result;
 }
@@ -370,9 +374,9 @@ async function classifyLive(siteKey, baseline, live, learned) {
 }
 
 async function runAutoWrite(effect) {
-  if (refreshState.locked) return;
-  const binding = refreshState.binding;
-  if (!binding || binding.snapshotId !== effect.snapshotId || binding.site !== effect.site) return;
+  if (siteLocked(refreshState, effect.site)) return;
+  const binding = bindingFor(refreshState, effect.site);
+  if (!binding || binding.snapshotId !== effect.snapshotId) return;
   if (writebackBudgetRemaining(effect.startedAt ?? Date.now(), Date.now()) <= 0) return;
 
   const profiles = await readProfiles();
@@ -406,22 +410,26 @@ async function runAutoWrite(effect) {
       authNames: classification.auth,
     });
   }
-  const applied = applyDecision(refreshState, { ...decision, learned, now: Date.now() });
+  const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
   refreshState = applied.state;
-  if (decision.action === "write" && refreshState.binding) {
+  const written = bindingFor(refreshState, binding.site);
+  if (decision.action === "write" && written) {
     refreshState = {
       ...refreshState,
-      binding: {
-        ...refreshState.binding,
-        identityHint: createSiteBinding({
-          profile,
-          storeId,
-          cookies: live,
-          classification,
-        }).identityHint,
-        learned,
-        expiresAt: decision.expiresAt,
-        lastRefreshedAt: Date.now(),
+      bindings: {
+        ...refreshState.bindings,
+        [binding.site]: {
+          ...written,
+          identityHint: createSiteBinding({
+            profile,
+            storeId,
+            cookies: live,
+            classification,
+          }).identityHint,
+          learned,
+          expiresAt: decision.expiresAt,
+          lastRefreshedAt: Date.now(),
+        },
       },
     };
   }
@@ -442,19 +450,19 @@ function handleCookieChanged(info) {
   if (!cookie?.domain || !cookieBelongsToSite(cookie.domain, cookieSite(cookie))) return;
   const site = cookieSite(cookie);
   if (!site) return;
-  const binding = refreshState.binding;
+  const binding = bindingFor(refreshState, site);
   if (binding?.storeId && cookie.storeId && cookie.storeId !== binding.storeId) return;
   const result = applyRefresh({
     type: "cookie",
     at: Date.now(),
     site,
-    snapshotId: binding?.site === site ? binding.snapshotId : null,
+    snapshotId: binding?.snapshotId || null,
   });
   if (result.effect.type === "write") enqueue(() => runAutoWrite(result.effect));
 }
 
 async function flushBoundSnapshot(tab, binding) {
-  if (!binding?.snapshotId || refreshState.locked) return;
+  if (!binding?.snapshotId || siteLocked(refreshState, binding.site)) return;
   if (binding.paused || binding.status === "identity-unknown" || binding.status === "maybe-logged-out") return;
   const profiles = await readProfiles();
   const profile = profiles.find((item) => item.id === binding.snapshotId);
@@ -497,7 +505,7 @@ async function flushBoundSnapshot(tab, binding) {
     ? { auth: classification.auth, identity: classification.identity }
     : null;
   if (decision.action === "pending" || decision.action === "pause" || decision.action === "unbind") {
-    const applied = applyDecision(refreshState, { ...decision, learned, now: Date.now() });
+    const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
     refreshState = applied.state;
     await persistRefresh();
     await updateBadge();
@@ -517,16 +525,16 @@ async function flushBoundSnapshot(tab, binding) {
     canRollback: true,
     authNames: classification.auth,
   });
-  const applied = applyDecision(refreshState, { ...decision, learned, now: Date.now() });
+  const applied = applyDecision(refreshState, { ...decision, site: binding.site, learned, now: Date.now() });
   refreshState = applied.state;
   await persistRefresh();
   await updateBadge();
 }
 
 async function mergeBoundStorage(siteKey, storage) {
-  if (refreshState.locked) return;
-  const binding = refreshState.binding;
-  if (!binding?.snapshotId || binding.site !== siteKey) return;
+  if (siteLocked(refreshState, siteKey)) return;
+  const binding = bindingFor(refreshState, siteKey);
+  if (!binding?.snapshotId) return;
   if (binding.paused || binding.status === "identity-unknown" || binding.status === "maybe-logged-out") return;
   const capture = await readProfileCapture(binding.snapshotId);
   if (!capture) return;
@@ -554,18 +562,6 @@ async function flushStorageMessage(message, sender) {
     localStorage: message?.localStorage || {},
     sessionStorage: message?.sessionStorage || {},
   });
-}
-
-async function ensureFlushScript() {
-  if (!chrome.scripting?.registerContentScripts) return;
-  await chrome.scripting.unregisterContentScripts({ ids: ["storage-flush"] }).catch(() => {});
-  await chrome.scripting.registerContentScripts([{
-    id: "storage-flush",
-    matches: ["http://*/*", "https://*/*"],
-    js: ["src/page-hide.js"],
-    runAt: "document_start",
-    persistAcrossSessions: true,
-  }]).catch(() => {});
 }
 
 async function bindProfile(profile, storeId, cookies, classification) {
@@ -685,17 +681,17 @@ async function inspect(tabId) {
   await sweepUndo();
   const hintId = await readActiveHint(target.siteKey);
   const { activeId, confirmedId, loggedIn } = await readLoginState(tab, target, profiles, hintId);
-  if (refreshState.binding?.site === target.siteKey
-    && !profiles.some((profile) => profile.id === refreshState.binding.snapshotId)) {
-    applyRefresh({ type: "unbind", notice: refreshState.notice });
+  const currentBinding = bindingFor(refreshState, target.siteKey);
+  if (currentBinding && !profiles.some((profile) => profile.id === currentBinding.snapshotId)) {
+    applyRefresh({ type: "unbind", site: target.siteKey, notice: null });
     await persistRefresh();
   }
-  let boundHere = refreshState.binding?.site === target.siteKey
-    && profiles.some((profile) => profile.id === refreshState.binding.snapshotId)
-    ? refreshState.binding.snapshotId
+  let boundHere = bindingFor(refreshState, target.siteKey)
+    && profiles.some((profile) => profile.id === bindingFor(refreshState, target.siteKey).snapshotId)
+    ? bindingFor(refreshState, target.siteKey).snapshotId
     : null;
   // 升级前已经登着的号还没有绑定。身份还能对上时补一次，之后就只跟绑定走。
-  if (!boundHere && confirmedId && !refreshState.locked) {
+  if (!boundHere && confirmedId && !siteLocked(refreshState, target.siteKey)) {
     const profile = profiles.find((item) => item.id === confirmedId);
     const capture = profile ? await readProfileCapture(profile.id) : null;
     if (profile && capture) {
@@ -785,7 +781,7 @@ async function updateProfile(tab, profileId) {
   const siteProfiles = profiles.filter((profile) => profile.siteKey === target.siteKey);
   const hintId = await readActiveHint(target.siteKey);
   const { activeId } = await readLoginState(tab, target, siteProfiles, hintId);
-  const boundId = refreshState.binding?.site === target.siteKey ? refreshState.binding.snapshotId : null;
+  const boundId = bindingFor(refreshState, target.siteKey)?.snapshotId || null;
   assertUpdatable(boundId || activeId, profileId);
 
   const capture = await validatedCapture(tab);
@@ -795,7 +791,9 @@ async function updateProfile(tab, profileId) {
     target.siteKey,
     previous?.cookies || [],
     capture.cookies,
-    refreshState.binding?.snapshotId === profileId ? refreshState.binding.learned : null,
+    bindingFor(refreshState, target.siteKey)?.snapshotId === profileId
+      ? bindingFor(refreshState, target.siteKey).learned
+      : null,
   );
   const now = Date.now();
   const next = await commitBoundCapture(existing, profiles, staged, {
@@ -823,8 +821,8 @@ async function deleteProfile(tab, profileId) {
   if (existing.siteKey && (await readActiveHint(existing.siteKey)) === profileId) {
     await writeActiveHint(existing.siteKey, null);
   }
-  if (refreshState.binding?.snapshotId === profileId) {
-    applyRefresh({ type: "unbind", notice: null });
+  if (existing.siteKey && bindingFor(refreshState, existing.siteKey)?.snapshotId === profileId) {
+    applyRefresh({ type: "unbind", site: existing.siteKey, notice: null });
     await persistRefresh();
   }
   await updateBadge();
@@ -984,8 +982,8 @@ async function startFreshLogin(tab, confirmed) {
   }
 
   const storeId = await getStoreIdForTab(tab.id);
-  const previous = refreshState.binding?.site === capture.siteKey ? refreshState.binding : null;
-  applyRefresh({ type: "lock" });
+  const previous = bindingFor(refreshState, capture.siteKey);
+  applyRefresh({ type: "lock", site: capture.siteKey });
   await persistRefresh();
   let applied;
   try {
@@ -1006,13 +1004,13 @@ async function startFreshLogin(tab, confirmed) {
       throw new Error("没能清空页面，原来的登录态已尽量恢复");
     }
   } catch (error) {
-    applyRefresh({ type: "unlock" });
+    applyRefresh({ type: "unlock", site: capture.siteKey });
     if (previous) applyRefresh({ type: "bind", binding: previous });
     await persistRefresh();
     throw error;
   }
 
-  applyRefresh({ type: "unlock" });
+  applyRefresh({ type: "unlock", site: capture.siteKey });
   await persistRefresh();
   const current = await chrome.tabs.get(tab.id);
   await writeActiveHint(capture.siteKey, null);
@@ -1052,13 +1050,13 @@ async function switchProfile(tab, profileId, confirmed = false) {
   if (!capture) throw new Error("找不到这个账号的登录态");
   const stored = { ...profile, ...capture, prev: undefined };
   const storeId = await getStoreIdForTab(tab.id);
-  const before = refreshState.binding?.site === stored.siteKey ? refreshState.binding : null;
+  const before = bindingFor(refreshState, stored.siteKey);
   if (before) await flushBoundSnapshot(tab, before);
-  const afterFlush = refreshState.binding?.snapshotId && before
-    && refreshState.binding.snapshotId === before.snapshotId
-    ? refreshState.binding
+  const stillBound = bindingFor(refreshState, stored.siteKey);
+  const afterFlush = stillBound?.snapshotId && before && stillBound.snapshotId === before.snapshotId
+    ? stillBound
     : null;
-  applyRefresh({ type: "lock" });
+  applyRefresh({ type: "lock", site: stored.siteKey });
   await persistRefresh();
   try {
     const result = await runSwitch({
@@ -1084,7 +1082,7 @@ async function switchProfile(tab, profileId, confirmed = false) {
         now: Date.now(),
       }),
     });
-    applyRefresh({ type: "unlock" });
+    applyRefresh({ type: "unlock", site: stored.siteKey });
     await persistRefresh();
     await writeActiveHint(stored.siteKey, stored.id);
     await updateBadge();
@@ -1099,7 +1097,7 @@ async function switchProfile(tab, profileId, confirmed = false) {
       },
     };
   } catch (error) {
-    applyRefresh({ type: "unlock" });
+    applyRefresh({ type: "unlock", site: stored.siteKey });
     if (afterFlush) applyRefresh({ type: "bind", binding: afterFlush });
     await persistRefresh();
     throw error;
@@ -1113,10 +1111,10 @@ async function rollbackProfile(tab, profileId) {
   const capture = await readProfileCapture(profileId);
   if (!capture || !canRollbackCapture(capture)) throw new Error("没有可回滚的上一版");
   const rolled = rollbackCapture(capture);
-  const binding = refreshState.binding;
-  const isBound = Boolean(binding && binding.snapshotId === profileId && binding.site === existing.siteKey);
+  const binding = bindingFor(refreshState, existing.siteKey);
+  const isBound = Boolean(binding && binding.snapshotId === profileId);
   if (isBound) {
-    applyRefresh({ type: "lock" });
+    applyRefresh({ type: "lock", site: existing.siteKey });
     await persistRefresh();
   }
   try {
@@ -1149,7 +1147,7 @@ async function rollbackProfile(tab, profileId) {
           paused: false,
         },
       });
-      applyRefresh({ type: "unlock" });
+      applyRefresh({ type: "unlock", site: existing.siteKey });
       await persistRefresh();
     }
     await updateBadge();
@@ -1162,7 +1160,7 @@ async function rollbackProfile(tab, profileId) {
   } catch (error) {
     if (isBound) {
       applyRefresh({ type: "bind", binding });
-      applyRefresh({ type: "unlock" });
+      applyRefresh({ type: "unlock", site: existing.siteKey });
       await persistRefresh();
     }
     throw error;
@@ -1206,7 +1204,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 installRefresh();
-ensureFlushScript();
 if (chrome.cookies?.onChanged?.addListener) {
   chrome.cookies.onChanged.addListener(handleCookieChanged);
 }

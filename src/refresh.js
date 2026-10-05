@@ -36,17 +36,113 @@ export const BUILTIN_SITE_RULES = {
   },
 };
 
+export const FLUSH_SCRIPT_ID = "storage-flush";
+
 export function initialRefreshState(overrides = {}) {
   return {
-    locked: false,
-    generation: 0,
-    binding: null,
-    notice: null,
-    debounce: null,
-    writeCount: 0,
-    unboundEvents: 0,
-    ...overrides,
+    bindings: { ...(overrides.bindings || {}) },
+    debounces: { ...(overrides.debounces || {}) },
+    locks: { ...(overrides.locks || {}) },
+    generations: { ...(overrides.generations || {}) },
+    notices: { ...(overrides.notices || {}) },
+    writeCount: overrides.writeCount || 0,
+    unboundEvents: overrides.unboundEvents || 0,
   };
+}
+
+export function bindingFor(state, site) {
+  return state?.bindings?.[site] || null;
+}
+
+export function siteLocked(state, site) {
+  return state?.locks?.[site] === true;
+}
+
+function withoutKey(map, key) {
+  const next = { ...(map || {}) };
+  delete next[key];
+  return next;
+}
+
+function generationFor(state, site) {
+  const value = state.generations?.[site];
+  return typeof value === "number" ? value : 0;
+}
+
+/**
+ * 重启时只丢掉仍处于切换锁里的那个站点。其他站点的绑定原样留下。
+ * 兼容旧的单 binding 结构：锁着就清那一个站，没锁就放进对应站点。
+ */
+export function hydrateRefreshState(saved) {
+  if (!saved || typeof saved !== "object") return { state: initialRefreshState(), changed: false };
+  const bindings = saved.bindings && typeof saved.bindings === "object" ? { ...saved.bindings } : {};
+  const locks = saved.locks && typeof saved.locks === "object" ? { ...saved.locks } : {};
+  const notices = saved.notices && typeof saved.notices === "object" ? { ...saved.notices } : {};
+  const generations = saved.generations && typeof saved.generations === "object" ? { ...saved.generations } : {};
+
+  if (saved.binding && typeof saved.binding === "object" && saved.binding.site && !bindings[saved.binding.site]) {
+    if (saved.locked === true) locks[saved.binding.site] = true;
+    else bindings[saved.binding.site] = saved.binding;
+  }
+  if (saved.notice?.site && !notices[saved.notice.site]) notices[saved.notice.site] = saved.notice;
+  if (typeof saved.generation === "number" && saved.binding?.site && generations[saved.binding.site] == null) {
+    generations[saved.binding.site] = saved.generation;
+  }
+
+  let changed = saved.locked === true || saved.binding != null;
+  for (const site of Object.keys(locks)) {
+    if (!locks[site]) {
+      delete locks[site];
+      continue;
+    }
+    if (bindings[site]) delete bindings[site];
+    delete locks[site];
+    changed = true;
+  }
+  return {
+    state: initialRefreshState({ bindings, locks, notices, generations }),
+    changed,
+  };
+}
+
+export function flushScriptMatches(bindings) {
+  const matches = [];
+  for (const binding of Object.values(bindings || {})) {
+    if (!binding?.snapshotId || !binding.origin) continue;
+    let url;
+    try {
+      url = new URL(binding.origin);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    const match = `${url.origin}/*`;
+    if (!matches.includes(match)) matches.push(match);
+  }
+  matches.sort();
+  return matches;
+}
+
+/** 按当前绑定重注册页面关闭脚本。没有绑定时只注销，不再对全网注入。 */
+export async function syncFlushScript(scripting, bindings) {
+  const matches = flushScriptMatches(bindings);
+  if (!scripting?.unregisterContentScripts && !scripting?.registerContentScripts) {
+    return { matches, unregistered: matches.length === 0 };
+  }
+  if (scripting.unregisterContentScripts) {
+    await scripting.unregisterContentScripts({ ids: [FLUSH_SCRIPT_ID] }).catch(() => {});
+  }
+  if (matches.length === 0 || !scripting.registerContentScripts) {
+    return { matches, unregistered: true };
+  }
+  await scripting.registerContentScripts([{
+    id: FLUSH_SCRIPT_ID,
+    matches,
+    js: ["src/page-hide.js"],
+    runAt: "document_start",
+    persistAcrossSessions: true,
+  }]);
+  return { matches, unregistered: false };
 }
 
 export function debounceDelay(startedAt, now, trailMs = TRAIL_MS, maxWaitMs = MAX_WAIT_MS) {
@@ -307,6 +403,7 @@ export function createSiteBinding({
     site: profile.siteKey,
     snapshotId: profile.id,
     boundAt: now,
+    origin: profile.origin || null,
     identityHint: identityHint(cookies, classification?.identity || []),
     storeId: storeId || null,
     status: "ok",
@@ -360,200 +457,198 @@ export function rollbackCapture(current) {
 }
 
 function boundTo(state, event) {
-  const binding = state.binding;
-  return Boolean(
-    binding
-    && binding.snapshotId
-    && binding.site === event.site
-    && binding.snapshotId === event.snapshotId,
-  );
+  const binding = bindingFor(state, event.site);
+  return Boolean(binding && binding.snapshotId && binding.snapshotId === event.snapshotId);
+}
+
+function writeEffect(binding, startedAt, generation, extra = {}) {
+  return {
+    type: "write",
+    site: binding.site,
+    snapshotId: binding.snapshotId,
+    startedAt,
+    generation,
+    writeCount: 0,
+    ...extra,
+  };
 }
 
 /**
- * 纯状态机。锁住期间的 cookie 事件直接丢掉，不进防抖队列，
- * 所以解锁之后也不会把这段变化补写回去。
+ * 纯状态机。绑定和防抖都按站点分桶。
+ * 切换锁只盖住正在切换的那个站点：锁内变化丢掉且解锁后不补写，其他站点照常计时。
  */
 export function reduceRefresh(state, event, options = {}) {
   const trailMs = options.trailMs ?? TRAIL_MS;
   const maxWaitMs = options.maxWaitMs ?? MAX_WAIT_MS;
+  const site = event.site || event.binding?.site || null;
 
   if (event.type === "lock") {
+    if (!site) return { state, effect: { type: "none", writeCount: 0 } };
     return {
       state: {
         ...state,
-        locked: true,
-        generation: state.generation + 1,
-        debounce: null,
-        binding: null,
+        bindings: withoutKey(state.bindings, site),
+        debounces: withoutKey(state.debounces, site),
+        locks: { ...state.locks, [site]: true },
+        generations: { ...state.generations, [site]: generationFor(state, site) + 1 },
       },
-      effect: { type: "cancel", writeCount: 0 },
+      effect: { type: "cancel", site, writeCount: 0 },
     };
   }
 
   if (event.type === "unlock") {
+    if (!site) return { state, effect: { type: "none", writeCount: 0 } };
     return {
-      state: { ...state, locked: false },
-      effect: { type: "none", writeCount: 0 },
+      state: { ...state, locks: withoutKey(state.locks, site) },
+      effect: { type: "none", site, writeCount: 0 },
     };
   }
 
   if (event.type === "bind") {
+    const binding = event.binding;
+    if (!binding?.site) return { state, effect: { type: "none", writeCount: 0 } };
     return {
       state: {
         ...state,
-        binding: event.binding || null,
-        notice: event.binding ? null : state.notice,
+        bindings: { ...state.bindings, [binding.site]: binding },
+        notices: withoutKey(state.notices, binding.site),
+        locks: withoutKey(state.locks, binding.site),
       },
-      effect: { type: "none", writeCount: 0 },
+      effect: { type: "none", site: binding.site, writeCount: 0 },
     };
   }
 
   if (event.type === "unbind") {
+    if (!site) return { state, effect: { type: "none", writeCount: 0 } };
+    const notices = { ...state.notices };
+    if (event.notice) notices[site] = { ...event.notice, site };
+    else delete notices[site];
     return {
       state: {
         ...state,
-        binding: null,
-        debounce: null,
-        notice: event.notice ?? null,
+        bindings: withoutKey(state.bindings, site),
+        debounces: withoutKey(state.debounces, site),
+        notices,
       },
-      effect: { type: "cancel", writeCount: 0 },
+      effect: { type: "cancel", site, writeCount: 0 },
     };
   }
 
   if (event.type === "cookie") {
-    if (state.locked) {
-      return { state, effect: { type: "ignore-locked", writeCount: 0 } };
+    if (siteLocked(state, site)) {
+      return { state, effect: { type: "ignore-locked", site, writeCount: 0 } };
     }
-    if (!boundTo(state, event)) {
+    const binding = bindingFor(state, site);
+    if (!binding || !boundTo(state, event)) {
       return {
         state: { ...state, unboundEvents: state.unboundEvents + 1 },
-        effect: { type: "ignore-unbound", writeCount: 0 },
+        effect: { type: "ignore-unbound", site, writeCount: 0 },
       };
     }
-    if (state.binding.paused || state.binding.status === "maybe-logged-out" || state.binding.status === "identity-unknown") {
-      return { state, effect: { type: "ignore-paused", writeCount: 0 } };
+    if (binding.paused || binding.status === "maybe-logged-out" || binding.status === "identity-unknown") {
+      return { state, effect: { type: "ignore-paused", site, writeCount: 0 } };
     }
-    const startedAt = state.debounce?.startedAt ?? event.at;
-    const generation = state.generation;
+    const startedAt = state.debounces?.[site]?.startedAt ?? event.at;
+    const generation = generationFor(state, site);
     const delay = debounceDelay(startedAt, event.at, trailMs, maxWaitMs);
     if (delay === 0) {
       return {
-        state: { ...state, debounce: null },
-        effect: {
-          type: "write",
-          site: state.binding.site,
-          snapshotId: state.binding.snapshotId,
-          startedAt,
-          generation,
-          writeCount: 0,
-        },
+        state: { ...state, debounces: withoutKey(state.debounces, site) },
+        effect: writeEffect(binding, startedAt, generation),
       };
     }
     return {
-      state: { ...state, debounce: { startedAt, generation } },
+      state: { ...state, debounces: { ...state.debounces, [site]: { startedAt, generation } } },
       effect: {
         type: "schedule",
         delay,
         generation,
-        site: state.binding.site,
-        snapshotId: state.binding.snapshotId,
+        site,
+        snapshotId: binding.snapshotId,
         writeCount: 0,
       },
     };
   }
 
   if (event.type === "timer") {
-    if (state.locked || !state.debounce || state.debounce.generation !== event.generation || !state.binding) {
-      const dropDebounce = state.debounce?.generation === event.generation;
+    const debounce = site ? state.debounces?.[site] : null;
+    const binding = bindingFor(state, site);
+    if (!site || siteLocked(state, site) || !debounce || debounce.generation !== event.generation || !binding) {
+      const dropDebounce = Boolean(site && debounce && debounce.generation === event.generation);
       return {
-        state: { ...state, debounce: dropDebounce ? null : state.debounce },
-        effect: { type: "drop", writeCount: 0 },
+        state: dropDebounce ? { ...state, debounces: withoutKey(state.debounces, site) } : state,
+        effect: { type: "drop", site, writeCount: 0 },
       };
     }
-    const startedAt = state.debounce.startedAt;
     return {
-      state: { ...state, debounce: null },
-      effect: {
-        type: "write",
-        site: state.binding.site,
-        snapshotId: state.binding.snapshotId,
-        startedAt,
-        generation: event.generation,
-        writeCount: 0,
-      },
+      state: { ...state, debounces: withoutKey(state.debounces, site) },
+      effect: writeEffect(binding, debounce.startedAt, event.generation),
     };
   }
 
   if (event.type === "flush") {
-    if (state.locked || !state.debounce || !state.binding) {
-      return { state, effect: { type: "none", writeCount: 0 } };
+    const debounce = site ? state.debounces?.[site] : null;
+    const binding = bindingFor(state, site);
+    if (!site || siteLocked(state, site) || !debounce || !binding) {
+      return { state, effect: { type: "none", site, writeCount: 0 } };
     }
-    const startedAt = state.debounce.startedAt;
     return {
-      state: { ...state, debounce: null },
-      effect: {
-        type: "write",
-        site: state.binding.site,
-        snapshotId: state.binding.snapshotId,
-        startedAt,
-        generation: state.generation,
-        flush: true,
-        writeCount: 0,
-      },
+      state: { ...state, debounces: withoutKey(state.debounces, site) },
+      effect: writeEffect(binding, debounce.startedAt, generationFor(state, site), { flush: true }),
     };
   }
 
   return { state, effect: { type: "none", writeCount: 0 } };
 }
 
+function withBinding(state, site, binding, extra = {}) {
+  return {
+    ...state,
+    ...extra,
+    bindings: binding ? { ...state.bindings, [site]: binding } : withoutKey(state.bindings, site),
+  };
+}
+
 export function applyDecision(state, decision) {
-  if (!state.binding) return { state, committed: false };
-  const expiresAt = decision.expiresAt ?? state.binding.expiresAt ?? null;
+  const site = decision.site;
+  const binding = bindingFor(state, site);
+  if (!binding) return { state, committed: false };
+  const expiresAt = decision.expiresAt ?? binding.expiresAt ?? null;
   if (decision.action === "write") {
     return {
-      state: {
-        ...state,
-        writeCount: state.writeCount + 1,
-        binding: {
-          ...state.binding,
-          status: "ok",
-          pendingUpdate: false,
-          paused: false,
-          expiresAt,
-          learned: decision.learned || state.binding.learned || null,
-          lastRefreshedAt: decision.now ?? state.binding.lastRefreshedAt,
-        },
-      },
+      state: withBinding(state, site, {
+        ...binding,
+        status: "ok",
+        pendingUpdate: false,
+        paused: false,
+        expiresAt,
+        learned: decision.learned || binding.learned || null,
+        lastRefreshedAt: decision.now ?? binding.lastRefreshedAt,
+      }, { writeCount: state.writeCount + 1, notices: withoutKey(state.notices, site) }),
       committed: true,
     };
   }
   if (decision.action === "pending") {
     return {
-      state: {
-        ...state,
-        binding: {
-          ...state.binding,
-          status: "identity-unknown",
-          pendingUpdate: true,
-          paused: true,
-          expiresAt,
-        },
-      },
+      state: withBinding(state, site, {
+        ...binding,
+        status: "identity-unknown",
+        pendingUpdate: true,
+        paused: true,
+        expiresAt,
+      }),
       committed: false,
     };
   }
   if (decision.action === "pause") {
     return {
-      state: {
-        ...state,
-        binding: {
-          ...state.binding,
-          status: "maybe-logged-out",
-          pendingUpdate: false,
-          paused: true,
-          expiresAt,
-        },
-      },
+      state: withBinding(state, site, {
+        ...binding,
+        status: "maybe-logged-out",
+        pendingUpdate: false,
+        paused: true,
+        expiresAt,
+      }),
       committed: false,
     };
   }
@@ -561,11 +656,15 @@ export function applyDecision(state, decision) {
     return {
       state: {
         ...state,
-        binding: null,
-        notice: {
-          site: state.binding.site,
-          status: "identity-changed",
-          prompt: decision.prompt || "save-as-new",
+        bindings: withoutKey(state.bindings, site),
+        debounces: withoutKey(state.debounces, site),
+        notices: {
+          ...state.notices,
+          [site]: {
+            site,
+            status: "identity-changed",
+            prompt: decision.prompt || "save-as-new",
+          },
         },
       },
       committed: false,
@@ -603,13 +702,11 @@ export function buildRefreshView({ view, profiles = [], refreshState = null, now
   const byId = new Map(list.map((profile) => [profile.id, profile]));
   const presented = (view?.profiles || []).map((summary) => presentProfile(summary, byId.get(summary.id), now));
 
-  const binding = refreshState?.binding || null;
-  const notice = refreshState?.notice || null;
   const site = view?.siteKey;
-  const bound = binding && binding.site === site && binding.snapshotId && byId.has(binding.snapshotId)
-    ? binding
-    : null;
-  const noticeHere = !bound && notice && notice.site === site ? notice : null;
+  const binding = bindingFor(refreshState, site);
+  const notice = refreshState?.notices?.[site] || null;
+  const bound = binding && binding.snapshotId && byId.has(binding.snapshotId) ? binding : null;
+  const noticeHere = !bound && notice ? notice : null;
   const boundSource = bound ? byId.get(bound.snapshotId) : null;
   const expiresAt = boundSource
     ? earliestExpiryMs(boundSource.keyExpiryTimes) ?? bound.expiresAt ?? null

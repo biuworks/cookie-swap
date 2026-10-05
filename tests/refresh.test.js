@@ -8,12 +8,15 @@ import {
   buildRefreshView,
   debounceDelay,
   evaluateLiveCookies,
+  FLUSH_SCRIPT_ID,
+  hydrateRefreshState,
   initialRefreshState,
   MAX_WAIT_MS,
   reduceRefresh,
   resolveClassification,
   rollbackCapture,
   stageCapture,
+  syncFlushScript,
   TRAIL_MS,
   WRITEBACK_BUDGET_MS,
   writebackBudgetRemaining,
@@ -34,37 +37,52 @@ function cookie(name, value, extra = {}) {
 }
 
 function createDriver(binding = BOUND) {
-  let state = initialRefreshState({ binding });
-  let due = null;
+  const list = Array.isArray(binding) ? binding : [binding];
+  const bindings = {};
+  for (const item of list) bindings[item.site] = item;
+  let state = initialRefreshState({ bindings });
+  const dues = {};
   const writes = [];
-  function fireIfDue(at) {
-    if (!due || at < due.at) return false;
-    const when = due.at;
-    const generation = due.generation;
-    due = null;
-    const fired = reduceRefresh(state, { type: "timer", at: when, generation });
-    state = fired.state;
-    if (fired.effect.type === "write") writes.push(when);
-    return fired.effect.type === "write";
+  function fireReady(at) {
+    let wrote = false;
+    const ready = Object.entries(dues)
+      .filter(([, due]) => due && at >= due.at)
+      .sort((left, right) => left[1].at - right[1].at || left[0].localeCompare(right[0]));
+    for (const [site, due] of ready) {
+      delete dues[site];
+      const fired = reduceRefresh(state, {
+        type: "timer",
+        at: due.at,
+        generation: due.generation,
+        site,
+      });
+      state = fired.state;
+      if (fired.effect.type === "write") {
+        writes.push({ at: due.at, site: fired.effect.site, snapshotId: fired.effect.snapshotId });
+        wrote = true;
+      }
+    }
+    return wrote;
   }
   function send(event) {
-    fireIfDue(event.at ?? 0);
+    if (typeof event.at === "number") fireReady(event.at);
     const result = reduceRefresh(state, event);
     state = result.state;
+    const site = result.effect.site || event.site || event.binding?.site;
     if (result.effect.type === "schedule") {
-      due = { at: event.at + result.effect.delay, generation: result.effect.generation };
+      dues[site] = { at: event.at + result.effect.delay, generation: result.effect.generation };
     } else if (result.effect.type === "write") {
-      writes.push(event.at);
-      due = null;
+      writes.push({ at: event.at, site: result.effect.site, snapshotId: result.effect.snapshotId });
+      delete dues[site];
     } else if (result.effect.type === "cancel" || result.effect.type === "drop") {
-      due = null;
+      if (site) delete dues[site];
     }
     return result;
   }
   return {
     send,
     elapse(at) {
-      return fireIfDue(at);
+      return fireReady(at);
     },
     get writes() {
       return writes;
@@ -73,7 +91,7 @@ function createDriver(binding = BOUND) {
       return state;
     },
     get due() {
-      return due;
+      return dues[list[0].site] || null;
     },
   };
 }
@@ -84,10 +102,10 @@ test("assertion 1: cookie changes during the switch lock are not written back, e
   assert.equal(scheduled.effect.type, "schedule");
   const generation = scheduled.effect.generation;
 
-  const locked = driver.send({ type: "lock" });
+  const locked = driver.send({ type: "lock", site: SITE });
   assert.equal(locked.effect.type, "cancel");
-  assert.equal(driver.state.locked, true);
-  assert.equal(driver.state.binding, null);
+  assert.equal(driver.state.locks[SITE], true);
+  assert.equal(driver.state.bindings[SITE], undefined);
   assert.equal(driver.due, null);
 
   for (const at of [10, 100, 1_000]) {
@@ -97,11 +115,11 @@ test("assertion 1: cookie changes during the switch lock are not written back, e
   }
   assert.equal(driver.due, null, "锁内变化不能排进防抖");
 
-  driver.send({ type: "unlock" });
-  assert.equal(driver.state.locked, false);
-  assert.equal(driver.state.debounce, null);
+  driver.send({ type: "unlock", site: SITE });
+  assert.equal(driver.state.locks[SITE], undefined);
+  assert.equal(driver.state.debounces[SITE], undefined);
   driver.elapse(60_000);
-  const stale = driver.send({ type: "timer", at: 60_000, generation });
+  const stale = driver.send({ type: "timer", at: 60_000, generation, site: SITE });
   assert.notEqual(stale.effect.type, "write");
   driver.send({
     type: "bind",
@@ -132,7 +150,7 @@ test("assertion 2: changes inside 1.5s collapse into one write, and a burst stil
   assert.equal(merged.due.at, 2_500, "尾随窗口从最后一次变化再等 1.5s");
   assert.equal(merged.elapse(2_499), false);
   assert.equal(merged.elapse(2_500), true);
-  assert.deepEqual(merged.writes, [2_500]);
+  assert.deepEqual(merged.writes.map((item) => item.at), [2_500]);
   assert.equal(merged.elapse(10_000), false);
 
   const burst = createDriver();
@@ -140,8 +158,8 @@ test("assertion 2: changes inside 1.5s collapse into one write, and a burst stil
     burst.send({ type: "cookie", at, site: SITE, snapshotId: "a" });
   }
   assert.equal(burst.writes.length, 1);
-  assert.ok(burst.writes[0] <= 3_000);
-  assert.equal(burst.writes[0], 3_000);
+  assert.ok(burst.writes[0].at <= 3_000);
+  assert.equal(burst.writes[0].at, 3_000);
 });
 
 test("assertion 3: rollback restores only the previous capture and then canRollback is false", () => {
@@ -170,7 +188,10 @@ test("assertion 3: rollback restores only the previous capture and then canRollb
       profiles: [{ id: "a", name: "工作号", active: true, savedAt: 1 }],
     },
     profiles: [{ id: "a", canRollback: false, savedAt: 1, keyExpiryTimes: [] }],
-    refreshState: { binding: { site: SITE, snapshotId: "a", status: "ok", pendingUpdate: false }, notice: null },
+    refreshState: {
+      bindings: { [SITE]: { site: SITE, snapshotId: "a", status: "ok", pendingUpdate: false } },
+      notices: {},
+    },
     now: 10_000,
   });
   assert.equal(view.canRollback, false);
@@ -198,12 +219,14 @@ test("assertion 4: when all three layers miss, status is identity-unknown and no
   assert.notEqual(decision.action, "write");
 
   const applied = applyDecision(initialRefreshState({
-    binding: { site: "unknown.test", snapshotId: "a", status: "ok", pendingUpdate: false },
-  }), decision);
+    bindings: {
+      "unknown.test": { site: "unknown.test", snapshotId: "a", status: "ok", pendingUpdate: false },
+    },
+  }), { ...decision, site: "unknown.test" });
   assert.equal(applied.committed, false);
   assert.equal(applied.state.writeCount, 0);
-  assert.equal(applied.state.binding.status, "identity-unknown");
-  assert.equal(applied.state.binding.pendingUpdate, true);
+  assert.equal(applied.state.bindings["unknown.test"].status, "identity-unknown");
+  assert.equal(applied.state.bindings["unknown.test"].pendingUpdate, true);
 
   const follow = reduceRefresh(applied.state, {
     type: "cookie",
@@ -255,8 +278,10 @@ test("assertion 5: an expired key cookie sets maybe-logged-out and expiresAt is 
       canRollback: false,
     }],
     refreshState: {
-      binding: { site: SITE, snapshotId: "a", status: "ok", pendingUpdate: true, expiresAt: 500_000 },
-      notice: null,
+      bindings: {
+        [SITE]: { site: SITE, snapshotId: "a", status: "ok", pendingUpdate: true, expiresAt: 500_000 },
+      },
+      notices: {},
     },
     now,
   });
@@ -392,4 +417,116 @@ test("builtin rules win, then per-site user rules, then a learned rotation", () 
   assert.equal(loggedOut.action, "pause");
   assert.equal(loggedOut.status, "maybe-logged-out");
   assert.equal(loggedOut.write, false);
+});
+
+test("two sites write back on their own bindings when cookie changes alternate", () => {
+  const driver = createDriver([
+    { site: "a.test", snapshotId: "acc-a", status: "ok" },
+    { site: "b.test", snapshotId: "acc-b", status: "ok" },
+  ]);
+  const firstA = driver.send({ type: "cookie", at: 0, site: "a.test", snapshotId: "acc-a" });
+  const firstB = driver.send({ type: "cookie", at: 100, site: "b.test", snapshotId: "acc-b" });
+  assert.equal(firstA.effect.type, "schedule");
+  assert.equal(firstB.effect.type, "schedule");
+  driver.send({ type: "cookie", at: 200, site: "a.test", snapshotId: "acc-a" });
+  driver.send({ type: "cookie", at: 300, site: "b.test", snapshotId: "acc-b" });
+  assert.equal(driver.state.bindings["a.test"].snapshotId, "acc-a");
+  assert.equal(driver.state.bindings["b.test"].snapshotId, "acc-b");
+  assert.equal(driver.elapse(1_699), false);
+  assert.equal(driver.elapse(1_700), true);
+  assert.equal(driver.elapse(1_800), true);
+  assert.deepEqual(driver.writes, [
+    { at: 1_700, site: "a.test", snapshotId: "acc-a" },
+    { at: 1_800, site: "b.test", snapshotId: "acc-b" },
+  ]);
+  assert.equal(driver.state.bindings["a.test"].snapshotId, "acc-a");
+  assert.equal(driver.state.bindings["b.test"].snapshotId, "acc-b");
+
+  driver.send({
+    type: "bind",
+    binding: { site: "b.test", snapshotId: "acc-b2", status: "ok" },
+  });
+  assert.equal(driver.state.bindings["a.test"].snapshotId, "acc-a");
+  assert.equal(driver.state.bindings["b.test"].snapshotId, "acc-b2");
+});
+
+test("locking one site leaves the other site's debounce and writeback on time", () => {
+  const driver = createDriver([
+    { site: "a.test", snapshotId: "acc-a", status: "ok" },
+    { site: "b.test", snapshotId: "acc-b", status: "ok" },
+  ]);
+  const scheduled = driver.send({ type: "cookie", at: 0, site: "a.test", snapshotId: "acc-a" });
+  assert.equal(scheduled.effect.delay, 1_500);
+  const locked = driver.send({ type: "lock", site: "b.test" });
+  assert.equal(locked.effect.site, "b.test");
+  assert.equal(driver.state.locks["b.test"], true);
+  assert.equal(driver.state.bindings["b.test"], undefined);
+  assert.equal(driver.state.bindings["a.test"].snapshotId, "acc-a");
+  assert.equal(driver.state.debounces["a.test"].startedAt, 0);
+  assert.equal(driver.due.at, 1_500);
+
+  const during = driver.send({ type: "cookie", at: 200, site: "b.test", snapshotId: "acc-b" });
+  assert.equal(during.effect.type, "ignore-locked");
+  assert.equal(driver.state.debounces["a.test"].startedAt, 0);
+  assert.equal(driver.elapse(1_499), false);
+  assert.equal(driver.elapse(1_500), true);
+  assert.deepEqual(driver.writes, [{ at: 1_500, site: "a.test", snapshotId: "acc-a" }]);
+  assert.equal(driver.state.bindings["a.test"].snapshotId, "acc-a");
+
+  const restarted = hydrateRefreshState({
+    bindings: {
+      "a.test": { site: "a.test", snapshotId: "acc-a" },
+      "b.test": { site: "b.test", snapshotId: "acc-b" },
+    },
+    locks: { "b.test": true },
+  });
+  assert.equal(restarted.changed, true);
+  assert.equal(restarted.state.bindings["a.test"].snapshotId, "acc-a");
+  assert.equal(restarted.state.bindings["b.test"], undefined);
+  assert.equal(restarted.state.locks["b.test"], undefined);
+});
+
+test("flush script matches only bound origins, updates on unbind, and unregisters when none remain", async () => {
+  const calls = [];
+  const scripting = {
+    async unregisterContentScripts(details) {
+      calls.push({ op: "unregister", ids: details.ids });
+    },
+    async registerContentScripts(scripts) {
+      calls.push({
+        op: "register",
+        ids: scripts.map((script) => script.id),
+        matches: scripts.map((script) => script.matches),
+      });
+    },
+  };
+  const bindings = {
+    "a.test": { site: "a.test", snapshotId: "acc-a", origin: "https://shop.a.test" },
+    "b.test": { site: "b.test", snapshotId: "acc-b", origin: "https://b.test" },
+  };
+
+  await syncFlushScript(scripting, bindings);
+  const registered = calls.filter((call) => call.op === "register");
+  assert.equal(registered.length, 1);
+  assert.deepEqual(registered[0].ids, [FLUSH_SCRIPT_ID]);
+  assert.deepEqual(registered[0].matches, [["https://b.test/*", "https://shop.a.test/*"]]);
+  for (const match of registered[0].matches.flat()) {
+    assert.equal(match === "http://*/*" || match === "https://*/*", false);
+    assert.equal(match.endsWith("/*"), true);
+  }
+
+  calls.length = 0;
+  await syncFlushScript(scripting, { "a.test": bindings["a.test"] });
+  const updated = calls.filter((call) => call.op === "register");
+  assert.equal(updated.length, 1);
+  assert.deepEqual(updated[0].matches, [["https://shop.a.test/*"]]);
+
+  calls.length = 0;
+  await syncFlushScript(scripting, {});
+  assert.equal(calls.some((call) => call.op === "unregister" && call.ids.includes(FLUSH_SCRIPT_ID)), true);
+  assert.equal(calls.some((call) => call.op === "register"), false);
+
+  const background = fs.readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  assert.match(background, /syncFlushScript\(chrome\.scripting,\s*refreshState\.bindings\)/);
+  assert.doesNotMatch(background, /https?:\/\/\*\/\*/);
 });
