@@ -228,6 +228,32 @@ export function materiallyChanged(baseline, live) {
   return false;
 }
 
+function isAnalyticsCookieName(name) {
+  return /^(?:_ga(?:_|$)|_gid$|_gat(?:_|$)|Hm_lvt_|Hm_lpvt_)/.test(String(name ?? ""));
+}
+
+/**
+ * 只给尚未确认身份的绑定用：比的是名字和值的增删改，过期时间滑动不算。
+ * 常见统计 Cookie 不参与这次判断，写回快照时仍会原样保存。
+ */
+export function unconfirmedMaterialChange(baseline, live) {
+  const left = new Map();
+  for (const cookie of baseline || []) {
+    if (!cookie?.name || isAnalyticsCookieName(cookie.name)) continue;
+    left.set(slotKey(cookie), cookie.value ?? "");
+  }
+  const right = new Map();
+  for (const cookie of live || []) {
+    if (!cookie?.name || isAnalyticsCookieName(cookie.name)) continue;
+    right.set(slotKey(cookie), cookie.value ?? "");
+  }
+  if (left.size !== right.size) return true;
+  for (const [key, value] of left) {
+    if (!right.has(key) || right.get(key) !== value) return true;
+  }
+  return false;
+}
+
 function isLongLived(cookie) {
   return cookie?.session !== true && typeof cookie.expirationDate === "number";
 }
@@ -387,7 +413,7 @@ export function unconfirmedFlushAction({
   if (decision?.action === "pause" || decision?.action === "unbind") return decision.action;
   const cookiesChanged = baselineCookies != null
     && liveCookies != null
-    && materiallyChanged(baselineCookies, liveCookies);
+    && unconfirmedMaterialChange(baselineCookies, liveCookies);
   if (
     cookiesChanged
     || decision?.action === "write"
@@ -415,7 +441,9 @@ export function evaluateLiveCookies({
   const auth = classification?.auth || [];
   const identity = classification?.identity || [];
   const expiresAt = earliestKeyExpiryMs(live, auth);
-  const changed = materiallyChanged(baseline, live);
+  const changed = learnedConfirmed === false
+    ? unconfirmedMaterialChange(baseline, live)
+    : materiallyChanged(baseline, live);
   const freshLearn = classification?.source === "learned" && learnedConfirmed === false;
 
   if (!classification?.classified || freshLearn) {

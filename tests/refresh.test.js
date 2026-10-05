@@ -24,6 +24,8 @@ import {
   syncFlushScript,
   TRAIL_MS,
   unconfirmedFlushAction,
+  unconfirmedMaterialChange,
+  materiallyChanged,
   WRITEBACK_BUDGET_MS,
   writebackBudgetRemaining,
 } from "../src/refresh.js";
@@ -779,4 +781,121 @@ test("unconfirmed switch flush that only changes storage does not enter pending"
     liveCookies: live,
     storageChanged: true,
   }), "confirmed");
+});
+
+test("unconfirmed binding stays ok when a session cookie only slides its expiry", () => {
+  const binding = {
+    site: "example.com",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  const baseline = [
+    cookie("sid", "same-sid", { expirationDate: 1_000, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+  ];
+  const live = [
+    cookie("sid", "same-sid", { expirationDate: 5_000, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+  ];
+  assert.equal(materiallyChanged(baseline, live), true);
+  assert.equal(unconfirmedMaterialChange(baseline, live), false);
+
+  const classification = resolveClassification({
+    siteKey: "example.com",
+    baseline,
+    live,
+    builtin: {},
+    user: {},
+    learned: null,
+  });
+  const decision = evaluateLiveCookies({
+    classification,
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(decision.action, "ignore");
+  assert.equal(decision.pendingUpdate, false);
+  assert.equal(decision.status, "ok");
+  const applied = applyDecision(initialRefreshState({
+    bindings: { "example.com": binding },
+  }), { ...decision, site: "example.com" });
+  assert.equal(applied.state.bindings["example.com"].status, "ok");
+  assert.equal(applied.state.bindings["example.com"].pendingUpdate, false);
+  assert.equal(applied.state.bindings["example.com"].paused, false);
+  assert.equal(unconfirmedFlushAction({
+    binding,
+    decision,
+    baselineCookies: baseline,
+    liveCookies: live,
+    storageChanged: false,
+  }), "skip");
+
+  const confirmed = evaluateLiveCookies({
+    classification: { classified: true, source: "learned", auth: ["sid"], identity: ["uid"] },
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: true,
+  });
+  assert.equal(confirmed.action, "write");
+});
+
+test("unconfirmed binding stays ok when only an analytics cookie changes", () => {
+  const binding = {
+    site: "example.com",
+    snapshotId: "acc-a",
+    status: "ok",
+    pendingUpdate: false,
+    paused: false,
+    learned: null,
+  };
+  const baseline = [
+    cookie("sid", "same-sid", { session: true, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+    cookie("Hm_lpvt_site", "111", { expirationDate: 1_000, domain: "example.com" }),
+  ];
+  const live = [
+    cookie("sid", "same-sid", { session: true, domain: "example.com" }),
+    cookie("uid", "user-a", { expirationDate: 9_000, domain: "example.com" }),
+    cookie("Hm_lpvt_site", "222", { expirationDate: 2_000, domain: "example.com" }),
+  ];
+  assert.equal(unconfirmedMaterialChange(baseline, live), false);
+  const classification = resolveClassification({
+    siteKey: "example.com",
+    baseline,
+    live,
+    builtin: {},
+    user: {},
+    learned: null,
+  });
+  const decision = evaluateLiveCookies({
+    classification,
+    baseline,
+    live,
+    now: 1_000,
+    learnedConfirmed: false,
+  });
+  assert.equal(decision.action, "ignore");
+  assert.equal(decision.write, false);
+  assert.equal(decision.pendingUpdate, false);
+  assert.equal(decision.status, "ok");
+  const applied = applyDecision(initialRefreshState({
+    bindings: { "example.com": binding },
+  }), { ...decision, site: "example.com" });
+  assert.equal(applied.state.bindings["example.com"].status, "ok");
+  assert.equal(applied.state.bindings["example.com"].pendingUpdate, false);
+  assert.equal(applied.state.bindings["example.com"].paused, false);
+  assert.equal(applied.state.bindings["example.com"].learned, null);
+  assert.equal(unconfirmedFlushAction({
+    binding,
+    decision,
+    baselineCookies: baseline,
+    liveCookies: live,
+    storageChanged: false,
+  }), "skip");
 });
