@@ -418,8 +418,7 @@ function statusCardHtml(profile) {
     + '<div class="status-txt"><div class="status-name">'
     + `<b>${esc(profile.name)}</b><span class="pill">${ICON.check}使用中</span></div>`
     + `${subHtml(profile)}</div>`
-    + (state.status === 'recovered' && state.boundProfileId === profile.id
-      ? `<button class="btn sec sm" data-act="switch" data-id="${profile.id}" type="button"${state.busy ? ' disabled' : ''}>切换到恢复版</button>` : '')
+    + `<button class="btn sec sm" data-act="switch" data-id="${profile.id}" type="button"${state.busy ? ' disabled' : ''}>${state.status === 'recovered' ? '切换到恢复版' : '重新应用'}</button>`
     + `<button class="icon" data-act="menu" data-id="${profile.id}" type="button" aria-label="更多操作"`
     + ` aria-expanded="${state.menuId === profile.id}">${ICON.more}</button>`
     + "</div>";

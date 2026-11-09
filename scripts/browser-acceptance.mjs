@@ -196,6 +196,21 @@ try {
   assert.deepEqual(await backup(id), fixed);
   pass('explicit switch applies restored capture and rejects stale generation messages');
 
+  await request({ type: 'delete', tabId: github.tabId, profileId: id });
+  await request({ type: 'restore', tabId: github.tabId, profileId: id });
+  await storage(github, 'A-live-without-binding');
+  const unboundRecovery = await request({ type: 'restore-protected-backup', tabId: github.tabId, profileId: id });
+  assert.equal(unboundRecovery.view.boundProfileId, null);
+  assert.equal(unboundRecovery.view.currentProfileId, id);
+  assert.equal((await page(github, () => localStorage.fixture)).result, 'A-live-without-binding');
+  await api(`chrome.tabs.update(${github.tabId},{active:true})`);
+  await call('Page.reload', {}, control.sessionId);
+  const applySelector = `[data-act="switch"][data-id="${id}"]`;
+  await until(() => api(`Boolean(document.querySelector(${JSON.stringify(applySelector)}))`), 'current snapshot apply button without binding');
+  await api(`document.querySelector(${JSON.stringify(applySelector)}).click()`);
+  await until(async () => (await page(github, () => localStorage.fixture)).result === 'A-initial', 'apply restored unbound current snapshot');
+  pass('delete undo plus backup restore still allows the current snapshot to be applied through the popup');
+
   const unknown = await site('unknown.example.test');
   await storage(unknown, 'unknown-v1');
   const u = await request({ type: 'save', tabId: unknown.tabId, name: 'Unknown fixture' });

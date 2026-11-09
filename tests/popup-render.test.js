@@ -286,6 +286,23 @@ test("rollback is shown only while canRollback is true", async () => {
   assert.doesNotMatch(dom.elements.get("body").innerHTML, /data-act="rollback"/);
 });
 
+test("a restored current snapshot can be applied after deleting and undoing its binding", async () => {
+  const dom = await boot();
+  click(dom, 'delete', 'work');
+  await tick();
+  clickStatic(dom, 'toast-undo');
+  await tick();
+  click(dom, 'restore-protected-backup', 'work');
+  await tick();
+  const body = dom.elements.get('body').innerHTML;
+  assert.match(body, /data-act="switch" data-id="work"/, '恢复后的当前快照不能因缺少绑定而没有切换入口');
+  click(dom, 'switch', 'work');
+  await tick();
+  click(dom, 'sheet-ok');
+  await tick();
+  assert.match(dom.elements.get('toast-text').textContent, /已切换到「工作号」/);
+});
+
 test("logged-out state never offers update or labels the bound account as current", async () => {
   const dom = await boot({ search: "?logout=1" });
   const body = dom.elements.get("body").innerHTML;
