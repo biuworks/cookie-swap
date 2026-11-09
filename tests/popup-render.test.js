@@ -241,3 +241,35 @@ test("profile names cannot inject markup", async () => {
 
   clickStatic(dom, "toast-close");
 });
+
+test("an empty snapshot list can open, cancel, and save its first snapshot", async () => {
+  const dom = await boot();
+  for (const id of ["personal", "work"]) {
+    click(dom, "delete", id);
+    await tick();
+  }
+  clickStatic(dom, "toast-close");
+  assert.match(dom.elements.get("body").innerHTML, /还没有快照/);
+
+  click(dom, "open-draft");
+  const draft = dom.elements.get("body").innerHTML;
+  assert.match(draft, /id="draft-name"/, "首次保存必须显示名称输入框");
+  assert.match(draft, /data-act="draft-save"/, "首次保存必须提供提交按钮");
+  assertBalanced(draft, "first snapshot draft");
+  assertButtonsWired(draft, "first snapshot draft");
+
+  click(dom, "draft-cancel");
+  assert.match(dom.elements.get("body").innerHTML, /还没有快照/);
+  assert.doesNotMatch(dom.elements.get("body").innerHTML, /id="draft-name"/);
+
+  click(dom, "open-draft");
+  type(dom, "draft-name", "首个账号");
+  click(dom, "draft-save");
+  await tick();
+
+  assert.match(dom.elements.get("body").innerHTML, /首个账号/);
+  assert.match(dom.elements.get("body").innerHTML, /使用中/);
+  assert.match(dom.elements.get("foot").innerHTML, /更新「首个账号」/);
+  assert.match(dom.elements.get("toast-text").textContent, /已保存「首个账号」/);
+  clickStatic(dom, "toast-close");
+});
