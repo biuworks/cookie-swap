@@ -17,7 +17,15 @@ export function toListRecord(profile, now = profile?.savedAt) {
     siteKey: profile.siteKey,
     origin: profile.origin,
     hostLabel: profile.hostLabel,
-    savedAt: now,
+    savedAt: typeof profile.savedAt === "number" ? profile.savedAt : now,
+    lastRefreshedAt: typeof profile.lastRefreshedAt === "number" ? profile.lastRefreshedAt : now,
+    canRollback: profile.canRollback === true,
+    backupAt: profile.backupAt || null,
+    backupSource: profile.backupSource || null,
+    accountKey: profile.accountKey || null,
+    keyExpiryTimes: Array.isArray(profile.keyExpiryTimes)
+      ? profile.keyExpiryTimes.filter((time) => typeof time === "number")
+      : [],
     cookieCount: profile.cookies?.length || 0,
     storageCount: Object.keys(profile.localStorage || {}).length + Object.keys(profile.sessionStorage || {}).length,
     expiryTimes: expirationTimes(profile.cookies),
@@ -62,7 +70,8 @@ export function assertCaptureSize(capture) {
 
 export function upsertProfile(profiles, draft, now = Date.now()) {
   const existing = profiles.find((item) => item.siteKey === draft.siteKey && item.name === draft.name);
-  const profile = toListRecord({ ...draft, id: existing?.id ?? draft.id }, now);
+  if (existing) throw new Error(`已经有一个叫「${draft.name}」的账号了，请使用不同名字另存`);
+  const profile = toListRecord(draft, now);
   return [profile, ...profiles.filter((item) => item.id !== profile.id)];
 }
 
@@ -176,7 +185,7 @@ export function saveHint(name, profiles) {
   } catch {
     return "";
   }
-  return profiles.some((profile) => profile.name === normalized) ? `将覆盖「${normalized}」` : "";
+  return profiles.some((profile) => profile.name === normalized) ? `已有「${normalized}」，请换个名字另存` : "";
 }
 
 export async function readProfiles() {
@@ -197,20 +206,44 @@ export async function readProfileCapture(id) {
     cookies: capture.cookies,
     localStorage: capture.localStorage || {},
     sessionStorage: capture.sessionStorage || {},
+    prev: capture.prev && Array.isArray(capture.prev.cookies) ? {
+      cookies: capture.prev.cookies,
+      localStorage: capture.prev.localStorage || {},
+      sessionStorage: capture.prev.sessionStorage || {},
+    } : null,
   };
 }
 
 export async function removeProfileCapture(id) {
-  await chrome.storage.local.remove(captureKey(id));
+  await chrome.storage.local.remove([captureKey(id), backupKey(id)]);
 }
 
-export async function commitProfile(index, id, capture) {
+export async function commitProfile(index, id, capture, extra = {}) {
+  assertCaptureSize(capture);
+  if (capture.prev) assertCaptureSize(capture.prev);
   await chrome.storage.local.set({
+    ...extra,
     [PROFILE_KEY]: index,
     [captureKey(id)]: {
       cookies: capture.cookies || [],
       localStorage: capture.localStorage || {},
       sessionStorage: capture.sessionStorage || {},
+      prev: capture.prev && Array.isArray(capture.prev.cookies) ? {
+        cookies: capture.prev.cookies,
+        localStorage: capture.prev.localStorage || {},
+        sessionStorage: capture.prev.sessionStorage || {},
+      } : null,
     },
   });
+}
+
+export function backupKey(id) { return `protectedBackup:${id}`; }
+export async function readProtectedBackup(id) {
+  const key = backupKey(id);
+  const value = (await chrome.storage.local.get(key))[key];
+  return value?.capture && Array.isArray(value.capture.cookies) ? value : null;
+}
+export function protectedBackup(capture, source, at = Date.now()) {
+  assertCaptureSize(capture);
+  return { version: 1, at, source, capture: structuredClone({ cookies: capture.cookies, localStorage: capture.localStorage || {}, sessionStorage: capture.sessionStorage || {} }) };
 }

@@ -165,7 +165,7 @@ test("an expired snapshot surfaces a warning, and detail only appears when opene
   assertBalanced(body, "expanded detail");
 });
 
-test("the menu only offers rename and delete, and delete can be undone", async () => {
+test("the menu offers backups but not live update of an arbitrary account; delete can be undone", async () => {
   const dom = await boot();
   click(dom, "menu", "personal");
   const body = dom.elements.get("body").innerHTML;
@@ -173,7 +173,9 @@ test("the menu only offers rename and delete, and delete can be undone", async (
 
   assert.match(menu, /重命名/);
   assert.match(menu, /删除这个快照/);
-  assert.doesNotMatch(menu, /更新/, "「更新」不该再出现在任何卡片菜单里");
+  assert.doesNotMatch(menu, /data-act="update"/, "不能用当前页面覆盖任意快照");
+  assert.match(menu, /data-act="restore-protected-backup"/);
+  assert.match(menu, /data-act="set-protected-backup"/);
   assert.doesNotMatch(menu, /详情/, "「详情」这一项已经删掉了");
 
   click(dom, "delete", "personal");
@@ -240,6 +242,75 @@ test("profile names cannot inject markup", async () => {
   assertBalanced(body, "after injection attempt");
 
   clickStatic(dom, "toast-close");
+});
+
+test("unknown identity defaults to save-as and requires a cancellable one-time confirmation", async () => {
+  const dom = await boot({ search: "?pending=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /该站无法识别换号/);
+  assert.doesNotMatch(body, /使用中/);
+  assert.match(foot, /另存为新账号/);
+  assert.match(foot, /确认更新「工作号」/);
+  assert.match(foot, /data-act="update"/);
+  assertButtonsWired(foot, "pending footer");
+  click(dom, 'update', 'work');
+  await tick();
+  assert.equal(dom.elements.get('sheet').hidden, false);
+  assert.match(dom.elements.get('sheet').innerHTML, /仅更新这一次/);
+  assert.match(dom.elements.get('sheet').innerHTML, /自动更新继续关闭/);
+  dom.listeners.get('document:keydown')({ key: 'Escape', target: {}, preventDefault() {} });
+  assert.equal(dom.elements.get('sheet').hidden, true);
+  assert.equal(dom.elements.get('body').inert, false);
+});
+
+test("an unbound site does not offer update", async () => {
+  const dom = await boot({ search: "?unbound=1" });
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(foot, /保存当前登录/);
+  assert.doesNotMatch(foot, /更新/);
+  assert.doesNotMatch(foot, /data-act="update"/);
+  assert.doesNotMatch(foot, /data-act="rollback"/);
+});
+
+test("rollback is shown only while canRollback is true", async () => {
+  const dom = await boot({ search: "?rollback=1" });
+  click(dom, 'menu', 'work');
+  assert.match(dom.elements.get("body").innerHTML, /data-act="rollback"/);
+  click(dom, "rollback", "work");
+  await tick();
+  assert.match(dom.elements.get("toast-text").textContent, /已恢复/);
+  assert.match(dom.elements.get("body").innerHTML, /自动更新已暂停/);
+  assert.match(dom.elements.get("body").innerHTML, /切换到恢复版/);
+  click(dom, 'menu', 'work');
+  assert.doesNotMatch(dom.elements.get("body").innerHTML, /data-act="rollback"/);
+});
+
+test("logged-out state never offers update or labels the bound account as current", async () => {
+  const dom = await boot({ search: "?logout=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /可能已登出/);
+  assert.doesNotMatch(foot, /data-act="update"/);
+  assert.doesNotMatch(body, /使用中/);
+  assert.match(foot, /登录新账号/);
+});
+
+test("saving over a changed identity uses the existing save action", async () => {
+  const dom = await boot({ search: "?saveas=1" });
+  const body = dom.elements.get("body").innerHTML;
+  const foot = dom.elements.get("foot").innerHTML;
+  assert.match(body, /另存为新账号？/);
+  assert.match(foot, /另存为新账号/);
+  assert.match(foot, /data-act="open-draft"/);
+  assert.doesNotMatch(foot, /data-act="update"/);
+});
+
+test("freshness labels are displayed as provided, not recomputed", async () => {
+  const dom = await boot({ search: "?stale=1" });
+  const body = dom.elements.get("body").innerHTML;
+  assert.match(body, /9天未刷新/);
+  assert.match(body, /将于10月9日过期/);
 });
 
 test("an empty snapshot list can open, cancel, and save its first snapshot", async () => {

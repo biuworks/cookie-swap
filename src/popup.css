@@ -488,6 +488,11 @@ h1 {
   line-height: 1.5;
 }
 
+.hintline.is-warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+}
+
 .load {
   display: flex;
   align-items: center;
@@ -552,7 +557,7 @@ h1 {
 }
 
 .ft:empty { display: none; }
-.ft .btn { flex: 1; }
+.ft .btn { flex: 1; white-space: normal; text-align: center; }
 
 .ft-note {
   flex: 1;
