@@ -25,7 +25,7 @@ test("account names collapse whitespace and reject empties", () => {
   assert.equal(normalizeName("字".repeat(40)), "字".repeat(40));
 });
 
-test("saving the same name on a site replaces that snapshot", () => {
+test("saving the same name refuses to overwrite; names on another site remain independent", () => {
   const first = upsertProfile([], {
     id: "new",
     name: "工作号",
@@ -36,7 +36,7 @@ test("saving the same name on a site replaces that snapshot", () => {
     localStorage: { token: "a" },
     sessionStorage: {},
   }, 10);
-  const second = upsertProfile(first, {
+  assert.throws(() => upsertProfile(first, {
     id: "other",
     name: "工作号",
     siteKey: "example.com",
@@ -45,15 +45,13 @@ test("saving the same name on a site replaces that snapshot", () => {
     cookies: [{ name: "sid", value: "b" }],
     localStorage: {},
     sessionStorage: { tab: "1" },
-  }, 20);
-  assert.equal(second.length, 1);
-  assert.equal(second[0].id, "new");
-  assert.equal(second[0].cookies, undefined);
-  assert.equal(second[0].cookieCount, 1);
-  assert.equal(second[0].identity.find(([key]) => key.startsWith("c:sid|"))[1], "b");
-  assert.equal(second[0].savedAt, 20);
+  }, 20), /不同名字另存/);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].id, "new");
+  assert.equal(first[0].savedAt, 10);
+  assert.equal(first[0].identity.find(([key]) => key.startsWith("c:sid|"))[1], "a");
 
-  const otherSite = upsertProfile(second, {
+  const otherSite = upsertProfile(first, {
     id: "elsewhere",
     name: "工作号",
     siteKey: "other.test",
@@ -86,7 +84,7 @@ test("summary shown in the popup does not include session values", () => {
   assert.equal(summary.storageCount, 2);
   assert.equal(summary.expiredCount, 0);
   assert.equal(summary.active, true);
-  assert.equal(saveHint("个人号", [summary]), "将覆盖「个人号」");
+  assert.equal(saveHint("个人号", [summary]), "已有「个人号」，请换个名字另存");
   assert.equal(saveHint("新号", [summary]), "");
 });
 

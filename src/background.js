@@ -2,39 +2,27 @@ import { pageOrigin, readPageTarget } from "./domain.js";
 import {
   cookieBelongsToSite,
   cookiesForRestore,
-  IDENTITY_AUTH_SOURCE,
-  IDENTITY_NOISE_SOURCE,
-  identityEntries,
-  matchActiveProfileId,
   mergeCookies,
-  needsFullIdentityStorage,
   toCookieRemoveDetails,
   toCookieSetDetails,
   toSnapshot,
 } from "./cookies.js";
-import { readIdentityStorage, readPageStorage, readUnsubmittedInput, writePageStorage } from "./page-storage.js";
+import { readPageStorage, readUnsubmittedInput, writePageStorage } from "./page-storage.js";
 import {
-  assertCapturable,
-  assertCaptureSize,
-  assertUpdatable,
   blankPlan,
-  commitProfile,
   dropUndo,
   normalizeName,
   readProfileCapture,
   readProfiles,
   removeProfileCapture,
-  replaceProfile,
-  resolveActiveId,
   staleUndoIds,
   stashUndo,
-  summarizeProfile,
   takeUndo,
   UNDO_KEY,
-  upsertProfile,
   writeProfiles,
 } from "./profiles.js";
 import { runSwitch } from "./swap.js";
+import { RefreshService } from "./refresh-service.js";
 
 let chain = Promise.resolve();
 
@@ -55,7 +43,7 @@ async function safeGetAll(details) {
   try {
     return await chrome.cookies.getAll(details);
   } catch {
-    return [];
+    throw new Error("读不到登录 Cookie，原快照已保留");
   }
 }
 
@@ -153,46 +141,12 @@ async function readCapture(tab) {
     siteKey: target.siteKey,
     origin: target.origin,
     hostLabel: target.hostLabel,
+    documentId: injection.documentId,
+    storeId,
     cookies,
     localStorage: storage.localStorage,
     sessionStorage: storage.sessionStorage,
   };
-}
-
-async function validatedCapture(tab) {
-  const capture = await readCapture(tab);
-  assertCapturable(capture);
-  assertCaptureSize(capture);
-  return capture;
-}
-
-async function profilesFor(tab) {
-  const target = readPageTarget(tab.url || "");
-  if (!target.ok) return { target, profiles: [] };
-  const profiles = (await readProfiles())
-    .filter((profile) => profile.siteKey === target.siteKey)
-    .sort((left, right) => right.savedAt - left.savedAt);
-  return { target, profiles };
-}
-
-function siteView(target, profiles, activeId, now = Date.now(), loggedIn = true) {
-  const visible = profiles
-    .filter((profile) => profile.siteKey === target.siteKey)
-    .sort((left, right) => right.savedAt - left.savedAt);
-  return {
-    phase: "ready",
-    siteKey: target.siteKey,
-    hostLabel: target.hostLabel,
-    origin: target.origin,
-    loggedIn,
-    profiles: visible.map((profile) => summarizeProfile(profile, activeId, now)),
-  };
-}
-
-async function buildView(tab, activeId) {
-  const { target, profiles } = await profilesFor(tab);
-  if (!target.ok) return { phase: "unsupported", reason: target.reason };
-  return siteView(target, profiles, activeId);
 }
 
 const ACTIVE_KEY = "activeBySite";
@@ -242,102 +196,13 @@ async function sweepUndo(now = Date.now()) {
   await Promise.all(orphans.map((id) => removeProfileCapture(id).catch(() => {})));
 }
 
-async function readLoginIdentity(tab, target) {
-  const [cookies, storage] = await Promise.all([
-    getStoreIdForTab(tab.id)
-      .then((storeId) => collectCookies(target.siteKey, tab.url, storeId))
-      .then((found) => found.map(toSnapshot))
-      .catch(() => null),
-    chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: readIdentityStorage,
-      args: [IDENTITY_AUTH_SOURCE, IDENTITY_NOISE_SOURCE],
-    }).then((injections) => {
-      const result = injections?.[0]?.result;
-      if (!result || result.origin !== target.origin) return null;
-      return result;
-    }).catch(() => null),
-  ]);
-
-  const cookieList = cookies || [];
-  let localStorage = storage?.localStorage || {};
-  if (needsFullIdentityStorage({ cookies: cookieList, localStorage }, storage?.otherKeys || 0)) {
-    try {
-      const [injection] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: readPageStorage,
-      });
-      const full = injection?.result;
-      if (full?.origin === target.origin) localStorage = full.localStorage || {};
-    } catch {
-      // Auth cookies and auth storage keys are still enough to identify the account.
-    }
-  }
-  if (!cookies && !storage) return null;
-  return { cookies: cookieList, localStorage };
-}
-
-/**
- * 一次读出「当前页面登录着没有」和「登录着的话是哪个快照」。
- *
- * 这两件事必须一起判断：没有任何匹配快照时，既可能是页面根本没登录，
- * 也可能是登录着一个还没保存过的账号 —— 界面上这两种情况的下一步完全不同
- * （前者要「登录新账号」，后者要「保存当前登录」）。
- */
-async function readLoginState(tab, target, profiles, hintId) {
-  const hinted = hintId && profiles.some((profile) => profile.id === hintId) ? hintId : null;
-  let capture = null;
-  try {
-    capture = await readLoginIdentity(tab, target);
-  } catch {
-    capture = null;
-  }
-  if (!capture) return { activeId: hinted, confirmedId: null, loggedIn: false };
-  const loggedIn = (capture.cookies?.length || 0) > 0
-    || Object.keys(capture.localStorage || {}).length > 0;
-  const hasIdentity = identityEntries(capture).length > 0;
-  // 传入 null 当 hint：只有真的按身份信息匹配上才会返回非空，
-  // 于是"上次切换过的账号"不会冒充成"正在使用"。
-  const confirmedId = matchActiveProfileId(capture, profiles, null);
-  return {
-    activeId: resolveActiveId({ confirmedId, hasIdentity, hinted }),
-    confirmedId,
-    loggedIn,
-  };
-}
-
 async function inspect(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  const { target, profiles } = await profilesFor(tab);
-  if (!target.ok) return { phase: "unsupported", reason: target.reason };
+  await refresh.ready;
   await sweepUndo();
-  const hintId = await readActiveHint(target.siteKey);
-  const { activeId, confirmedId, loggedIn } = await readLoginState(tab, target, profiles, hintId);
-  // 对不上就顺手把过期的 hint 清掉，别让它一直留着误导下一次判断
-  if (confirmedId !== hintId) await writeActiveHint(target.siteKey, confirmedId);
-  return siteView(target, profiles, activeId, Date.now(), loggedIn);
+  return refresh.inspect(await chrome.tabs.get(tabId));
 }
 
-async function saveProfile(tab, name) {
-  const label = normalizeName(name);
-  const capture = await validatedCapture(tab);
-  const profiles = await readProfiles();
-  const overwritten = profiles.some((profile) => profile.siteKey === capture.siteKey && profile.name === label);
-  const next = upsertProfile(profiles, { ...capture, name: label, id: crypto.randomUUID() });
-  await commitProfile(next, next[0].id, capture);
-  await writeActiveHint(capture.siteKey, next[0].id);
-  return {
-    view: siteView(capture, next, next[0].id),
-    effect: {
-      type: "saved",
-      name: label,
-      overwritten,
-      cookieCount: capture.cookies.length,
-      storageCount: Object.keys(capture.localStorage || {}).length
-        + Object.keys(capture.sessionStorage || {}).length,
-    },
-  };
-}
+async function saveProfile(tab, name) { return refresh.save(tab, name); }
 
 async function renameProfile(tab, profileId, name) {
   const label = normalizeName(name);
@@ -356,39 +221,12 @@ async function renameProfile(tab, profileId, name) {
   };
 }
 
-/**
- * 用当前页面的登录态覆盖一个已有快照。
- *
- * 只有「当前正在使用的那个账号」才允许被覆盖：updateProfile 读的是当前页面的
- * 登录态，如果允许指定任意快照，就会把 A 账号的会话写进 B 账号的快照里，
- * 而且没有任何提示。所以这里要求目标快照必须就是当前激活账号。
- */
-async function updateProfile(tab, profileId) {
-  const profiles = await readProfiles();
-  const existing = profiles.find((profile) => profile.id === profileId);
-  if (!existing) throw new Error("找不到这个账号快照");
-  const target = readPageTarget(tab.url || "");
-  if (!target.ok) throw new Error(target.reason);
-  const siteProfiles = profiles.filter((profile) => profile.siteKey === target.siteKey);
-  const hintId = await readActiveHint(target.siteKey);
-  const { activeId } = await readLoginState(tab, target, siteProfiles, hintId);
-  assertUpdatable(activeId, profileId);
-
-  const capture = await validatedCapture(tab);
-  const next = replaceProfile(profiles, profileId, capture);
-  await commitProfile(next, profileId, capture);
-  await writeActiveHint(capture.siteKey, profileId);
-  return {
-    view: siteView(capture, next, profileId),
-    effect: { type: "updated", name: existing.name },
-  };
-}
-
 async function deleteProfile(tab, profileId) {
   const profiles = await readProfiles();
   const existing = profiles.find((profile) => profile.id === profileId);
   if (!existing) throw new Error("找不到这个账号快照");
   await sweepUndo();
+  await refresh.forget(profileId);
   await writeProfiles(profiles.filter((profile) => profile.id !== profileId));
   await writeUndo(stashUndo(await readUndo(), existing));
   if (existing.siteKey && (await readActiveHint(existing.siteKey)) === profileId) {
@@ -550,6 +388,7 @@ async function startFreshLogin(tab, confirmed) {
   }
 
   const storeId = await getStoreIdForTab(tab.id);
+  const lockKey = await refresh.beforeSwitch(tab, capture.siteKey);
   const applied = await applyCookies(capture.siteKey, tab.url, storeId, []);
   try {
     await clearStorageOnReload(tab.id, capture.origin);
@@ -567,10 +406,11 @@ async function startFreshLogin(tab, confirmed) {
     throw new Error("没能清空页面，原来的登录态已尽量恢复");
   }
 
+  await refresh.pause(lockKey, "logged-out");
   const current = await chrome.tabs.get(tab.id);
   await writeActiveHint(capture.siteKey, null);
   return {
-    view: await buildView(current, null),
+    view: await refresh.inspect(current),
     effect: { type: "fresh" },
   };
 }
@@ -602,23 +442,34 @@ async function switchProfile(tab, profileId, confirmed = false) {
   }
   const capture = await readProfileCapture(profile.id);
   if (!capture) throw new Error("找不到这个账号的登录态");
-  const stored = { ...profile, ...capture };
   const storeId = await getStoreIdForTab(tab.id);
-  const result = await runSwitch({
-    tab,
-    profile: stored,
-    storeId,
-    applyCookies,
-    writeStorage,
-    reload: (tabId) => chrome.tabs.reload(tabId),
-    navigate: navigateToOrigin,
-    getTab: (tabId) => chrome.tabs.get(tabId),
-  });
+  if (readPageTarget(tab.url).siteKey !== profile.siteKey) throw new Error("这个快照属于别的网站，没有切换");
+  const key = await refresh.beforeSwitch(tab, profile.siteKey);
+  let result;
+  try {
+    // The outgoing flush may update this same snapshot. Apply the committed version.
+    const currentCapture = await readProfileCapture(profile.id);
+    if (!currentCapture) throw new Error("找不到这个账号的登录态");
+    const stored = { ...profile, ...currentCapture };
+    result = await runSwitch({
+      tab, profile: stored, storeId, applyCookies, writeStorage,
+      reload: async (tabId) => {
+        const pending = waitForReload(tabId);
+        pending.promise.catch(() => {});
+        try { await chrome.tabs.reload(tabId); await pending.promise; }
+        finally { pending.cancel(); }
+      },
+      navigate: navigateToOrigin, getTab: (tabId) => chrome.tabs.get(tabId),
+    });
+    await refresh.afterSwitch(await chrome.tabs.get(tab.id), profile, result.failedCount);
+  } catch (error) {
+    await refresh.pause(key, 'interrupted');
+    throw error;
+  }
   const current = await chrome.tabs.get(tab.id);
-  const landed = readPageTarget(current.url || "");
-  await writeActiveHint(stored.siteKey, stored.id);
+  await writeActiveHint(profile.siteKey, profile.id);
   return {
-    view: siteView(landed.ok ? landed : stored, profiles, stored.id),
+    view: await refresh.inspect(current),
     effect: {
       type: "switched",
       name: profile.name,
@@ -629,6 +480,7 @@ async function switchProfile(tab, profileId, confirmed = false) {
 }
 
 async function mutate(message) {
+  await refresh.ready;
   if (message.type === "delete" || message.type === "restore") {
     const tab = await chrome.tabs.get(message.tabId);
     return message.type === "delete"
@@ -639,7 +491,10 @@ async function mutate(message) {
   const tab = await chrome.tabs.get(message.tabId);
   if (message.type === "save") return saveProfile(tab, message.name);
   if (message.type === "rename") return renameProfile(tab, message.profileId, message.name);
-  if (message.type === "update") return updateProfile(tab, message.profileId);
+  if (message.type === "update") return refresh.update(tab, message.profileId, message.confirmationToken);
+  if (["rollback", "set-protected-backup", "restore-protected-backup"].includes(message.type)) {
+    return refresh.backupAction(tab, message.profileId, message.type, message.confirmationToken);
+  }
   if (message.type === "switch") {
     return switchProfile(tab, message.profileId, Boolean(message.confirmed));
   }
@@ -647,12 +502,20 @@ async function mutate(message) {
   throw new Error("无效请求");
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  const task = message?.type === "inspect"
-    ? inspect(message.tabId)
-    : enqueue(() => mutate(message));
-  task
-    .then((data) => sendResponse({ ok: true, ...data }))
-    .catch((error) => sendResponse({ ok: false, error: error?.message || "操作失败" }));
+const refresh = new RefreshService({ api: chrome, enqueue, getStoreId: getStoreIdForTab, collectCookies, readCapture });
+refresh.start().catch(() => {});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const task = enqueue(async () => {
+    await refresh.ready;
+    if (message?.type === 'observer-ready' || message?.type === 'flush-storage') {
+      return { observer: await refresh.observer(message, sender) };
+    }
+    // Page content scripts may only use the observer protocol.
+    if (sender?.tab && !String(sender.url || '').startsWith(chrome.runtime.getURL(''))) throw new Error('无效来源');
+    return message?.type === 'inspect' ? { view: await inspect(message.tabId) } : mutate(message);
+  });
+  task.then(data => sendResponse({ ok: true, ...data }))
+    .catch(error => sendResponse({ ok: false, error: error?.message || '操作失败' }));
   return true;
 });
