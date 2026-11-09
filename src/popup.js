@@ -378,7 +378,9 @@ function bodyHtml() {
     return `<div class="empty"><h3>这个页面用不了</h3><p>${esc(state.reason || "先打开一个普通网页，再点这个图标。")}</p></div>`;
   }
 
-  if (state.profiles.length === 0) return emptyHtml();
+  if (state.profiles.length === 0) {
+    return state.draftOpen ? `<div class="group">${draftHtml()}</div>` : emptyHtml();
+  }
 
   const current = currentProfile();
   const others = state.profiles.filter((profile) => profile.id !== state.activeId);
